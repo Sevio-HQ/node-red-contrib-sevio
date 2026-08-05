@@ -1,0 +1,26 @@
+{
+  "name": "node-red-contrib-sevio",
+  "version": "1.0.0",
+  "description": "Sevio node set",
+  "main": "config-load.js",
+  "node-red": {
+    "version": ">=4.0.0",
+    "nodes": {
+      "config-load": "config-load.js",
+      "sevio-lifecycle": "sevio-lifecycle.js"
+    }
+  },
+  "scripts": {
+    "test": "mocha \"test/**/*_spec.js\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Sevio-HQ/node-red-contrib-sevio.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Sevio-HQ/node-red-contrib-sevio/issues"
+  },
+  "homepage": "https://github.com/Sevio-HQ/node-red-contrib-sevio#readme"
+}

@@ -1,0 +1,39 @@
+<script type="text/javascript">
+  RED.nodes.registerType('sevio-lifecycle', {
+    category: 'Sevio',
+    color: '#a6bbcf',
+    defaults: {
+      name: { value: '' },
+      deviceNodeId: { value: '', required: true }
+    },
+    inputs: 0,
+    outputs: 0,
+    icon: 'lifecycle.png',
+    label: function() {
+      return this.name || 'sevio-lifecycle';
+    }
+  });
+</script>
+
+<script type="text/html" data-template-name="sevio-lifecycle">
+  <div class="form-row">
+    <label for="node-input-name">
+      <i class="fa fa-tag"></i>
+      Name
+    </label>
+    <input type="text" id="node-input-name" placeholder="Name">
+  </div>
+  <div class="form-row">
+    <label for="node-input-deviceNodeId">
+      <i class="fa fa-cube"></i>
+      Device Node ID
+    </label>
+    <input type="text" id="node-input-deviceNodeId" placeholder="Enter device node ID">
+  </div>
+</script>
+
+<script type="text/html" data-help-name="sevio-lifecycle">
+  <p>A lifecycle node that publishes a Sparkplug DDEATH message when the flow is deleted.
+  It sends <code>msg.command.device.death</code> to the configured device node via
+  <code>node.receive()</code>, triggering the device node's <code>sendDDeath()</code> method.</p>
+</script>
