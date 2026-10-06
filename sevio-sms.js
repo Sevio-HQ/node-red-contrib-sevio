@@ -173,28 +173,46 @@ module.exports = (RED) => {
           return;
         }
 
-        const socket = callUbus(ubusSocket, 'sms', 'send', { to: to, body: body }, (ubusErr, result) => {
-          sockets.delete(socket);
+        // One ubus call per recipient: rpcd's sms service has a 30 s exec
+        // timeout and a single send can take ~22 s worst case, so a combined
+        // call could be killed mid-flight. Fail-fast on the first recipient
+        // that fails; only report success once all of them have succeeded.
+        const refs = [];
+        const sendNext = (index) => {
           if (closed) return;
-          if (ubusErr) {
-            fail(ubusErr.code, ubusErr.message);
-            return;
-          }
-
-          const reply = result && typeof result === 'object' ? result : {};
-          if (reply.ok) {
+          if (index >= to.length) {
             const out = Object.assign({}, msg, { payload: { ok: true } });
-            if (reply.ref !== undefined && reply.ref !== null) {
-              out.payload.ref = reply.ref;
+            if (refs.length > 0) {
+              out.payload.ref = refs.join(',');
             }
             node.status({ fill: 'green', shape: 'dot', text: 'sent' });
             send([out, null]);
             done();
-          } else {
-            fail(reply.code || 'send_failed', reply.message || 'sms send failed');
+            return;
           }
-        });
-        sockets.add(socket);
+
+          const socket = callUbus(ubusSocket, 'sms', 'send', { to: [to[index]], body: body }, (ubusErr, result) => {
+            sockets.delete(socket);
+            if (closed) return;
+            if (ubusErr) {
+              fail(ubusErr.code, ubusErr.message);
+              return;
+            }
+
+            const reply = result && typeof result === 'object' ? result : {};
+            if (reply.ok) {
+              if (reply.ref !== undefined && reply.ref !== null) {
+                refs.push(reply.ref);
+              }
+              sendNext(index + 1);
+            } else {
+              fail(reply.code || 'send_failed', reply.message || 'sms send failed');
+            }
+          });
+          sockets.add(socket);
+        };
+
+        sendNext(0);
       });
     });
 

@@ -139,6 +139,54 @@ test('ubus success reply goes to output 1 with { ok: true, ref }', async (t) => 
   assert.equal(node.statusCalls[node.statusCalls.length - 1].text, 'sent');
 });
 
+test('multi-recipient alert fans out one ubus call per recipient and joins refs', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipients = ['+390000000001', '+390000000002', '+390000000003'];
+  const recipientsFile = writeRecipients(dir, { 'a-1': recipients });
+  const socketPath = path.join(dir, 'ubus.sock');
+  const requests = [];
+  const stub = await startStubUbus(socketPath, (request, socket) => {
+    requests.push(request);
+    socket.end(JSON.stringify({ jsonrpc: '2.0', result: [0, { ok: true, ref: `ref-${requests.length}` }] }) + '\n');
+  });
+  t.after(() => stub.close());
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusSocket: socketPath });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assert.equal(requests.length, recipients.length);
+  assert.deepEqual(
+    requests.map((request) => request.params),
+    recipients.map((number) => ['sms', 'send', { to: [number], body: 'hello' }])
+  );
+  assert.equal(node.sent.length, 1);
+  const [success, failure] = node.sent[0];
+  assert.equal(failure, null);
+  assert.deepEqual(success.payload, { ok: true, ref: 'ref-1,ref-2,ref-3' });
+  assert.equal(node.statusCalls[node.statusCalls.length - 1].text, 'sent');
+});
+
+test('success without any ref omits ref from the output payload', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000000'] });
+  const socketPath = path.join(dir, 'ubus.sock');
+  const stub = await startStubUbus(socketPath, (request, socket) => {
+    socket.end(JSON.stringify({ jsonrpc: '2.0', result: [0, { ok: true }] }) + '\n');
+  });
+  t.after(() => stub.close());
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusSocket: socketPath });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  const [success, failure] = node.sent[0];
+  assert.equal(failure, null);
+  assert.deepEqual(success.payload, { ok: true });
+});
+
 test('ubus failure reply goes to output 2 with code and message', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -161,15 +209,52 @@ test('ubus failure reply goes to output 2 with code and message', async (t) => {
   assert.equal(node.statusCalls[node.statusCalls.length - 1].fill, 'red');
 });
 
-test('close during an in-flight call drops the late result', async (t) => {
+test('failure on the second recipient aborts the fan-out and reports it', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000000'] });
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001', '+390000000002', '+390000000003']
+  });
   const socketPath = path.join(dir, 'ubus.sock');
+  const requests = [];
+  const stub = await startStubUbus(socketPath, (request, socket) => {
+    requests.push(request);
+    const reply = requests.length === 2
+      ? { ok: false, code: 'send_failed', message: 'second recipient failed' }
+      : { ok: true, ref: 'ref-1' };
+    socket.end(JSON.stringify({ jsonrpc: '2.0', result: [0, reply] }) + '\n');
+  });
+  t.after(() => stub.close());
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusSocket: socketPath });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  // Give a stray third call time to arrive before asserting the fan-out stopped.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0].params, ['sms', 'send', { to: ['+390000000001'], body: 'hello' }]);
+  assert.deepEqual(requests[1].params, ['sms', 'send', { to: ['+390000000002'], body: 'hello' }]);
+  assert.equal(node.sent.length, 1);
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.deepEqual(failure.payload, { ok: false, code: 'send_failed', message: 'second recipient failed' });
+  assert.equal(node.errors.length, 1);
+  assert.equal(node.statusCalls[node.statusCalls.length - 1].fill, 'red');
+});
+
+test('close mid-fan-out drops the late result and the remaining recipients', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001', '+390000000002'] });
+  const socketPath = path.join(dir, 'ubus.sock');
+  const requests = [];
   let serverSocket = null;
   let seenRequest;
   const requestSeen = new Promise((resolve) => { seenRequest = resolve; });
   const stub = await startStubUbus(socketPath, (request, socket) => {
+    requests.push(request);
     serverSocket = socket;
     seenRequest();
   });
@@ -186,6 +271,7 @@ test('close during an in-flight call drops the late result', async (t) => {
   }
   await new Promise((resolve) => setTimeout(resolve, 50));
 
+  assert.equal(requests.length, 1);
   assert.equal(node.sent.length, 0);
   assert.equal(node.errors.length, 0);
   assert.equal(node.statusCalls.some((status) => status.text === 'sent'), false);
