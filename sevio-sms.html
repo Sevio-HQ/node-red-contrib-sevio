@@ -1,0 +1,35 @@
+<script type="text/javascript">
+  RED.nodes.registerType('sevio-sms', {
+    category: 'Sevio',
+    color: '#a6bbcf',
+    defaults: {
+      name: { value: '' }
+    },
+    inputs: 1,
+    outputs: 2,
+    icon: 'sms.png',
+    label: function() {
+      return this.name || 'sevio-sms';
+    }
+  });
+</script>
+
+<script type="text/html" data-template-name="sevio-sms">
+  <div class="form-row">
+    <label for="node-input-name">
+      <i class="fa fa-tag"></i>
+      Name
+    </label>
+    <input type="text" id="node-input-name" placeholder="Name">
+  </div>
+</script>
+
+<script type="text/html" data-help-name="sevio-sms">
+  <p>Sends an SMS alert through the router's <code>sms</code> ubus service (rpcd).</p>
+  <p>Input <code>msg.payload</code>: <code>{ alertId, body }</code>. The node resolves
+  the recipient numbers for <code>alertId</code> from
+  <code>/tmp/datagateway-alert-recipients.json</code>, written by datagateway;
+  recipient numbers are never stored in the flow.</p>
+  <p><b>Output 1 — sent:</b> <code>{ ok: true, ref? }</code>.</p>
+  <p><b>Output 2 — failed:</b> <code>{ ok: false, code, message }</code>.</p>
+</script>
