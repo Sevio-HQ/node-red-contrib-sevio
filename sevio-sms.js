@@ -3,7 +3,10 @@ module.exports = (RED) => {
   const net = require('net');
 
   const RECIPIENTS_FILE = '/tmp/datagateway-alert-recipients.json';
-  const UBUS_SOCKET = '/var/run/ubus.sock';
+  // ubus is exposed to local processes through the JSON-RPC proxy
+  // (`ubus-json-server`) — `/var/run/ubus.sock` does not exist on the device.
+  // Mirrors datagateway-api's UBUS_SOCKET_PATH default.
+  const UBUS_SOCKET = '/var/run/ubus-json.sock';
   // rpcd's own ubus call timeout is 30 s (a roaming SMSC ack can be slow);
   // leave margin so the server can answer before we give up.
   const UBUS_TIMEOUT_MS = 35000;
@@ -135,9 +138,10 @@ module.exports = (RED) => {
   function SevioSmsNode(config) {
     RED.nodes.createNode(this, config);
     const node = this;
-    // Overridable in tests; the production paths are fixed by the contract.
+    // Overridable in tests (`config.*`) and in the dev harness
+    // (`SEVIO_SMS_UBUS_SOCKET`); the production paths are fixed by the contract.
     const recipientsFile = config.recipientsFile || RECIPIENTS_FILE;
-    const ubusSocket = config.ubusSocket || UBUS_SOCKET;
+    const ubusSocket = config.ubusSocket || process.env.SEVIO_SMS_UBUS_SOCKET || UBUS_SOCKET;
     const sockets = new Set();
     let closed = false;
 
