@@ -141,7 +141,21 @@ module.exports = (RED) => {
     // Overridable in tests (`config.*`) and in the dev harness
     // (`SEVIO_SMS_UBUS_SOCKET`); the production paths are fixed by the contract.
     const recipientsFile = config.recipientsFile || RECIPIENTS_FILE;
-    const ubusSocket = config.ubusSocket || process.env.SEVIO_SMS_UBUS_SOCKET || UBUS_SOCKET;
+    const envSocket = process.env.SEVIO_SMS_UBUS_SOCKET;
+    const ubusSocket = config.ubusSocket || envSocket || UBUS_SOCKET;
+    // An env override silently redirects every alert away from the default
+    // socket; warn once (per node, at construction) so a misconfigured device
+    // is diagnosable from the flow editor. An explicit node config is visible
+    // in the flow itself, so only the env-var path warns. Path only — recipient
+    // data is never logged.
+    if (!config.ubusSocket && envSocket && envSocket !== UBUS_SOCKET) {
+      const warning = `sevio-sms: using ubus socket ${envSocket} from SEVIO_SMS_UBUS_SOCKET (default: ${UBUS_SOCKET})`;
+      if (typeof node.warn === 'function') {
+        node.warn(warning);
+      } else {
+        console.warn(warning);
+      }
+    }
     const sockets = new Set();
     let closed = false;
 
