@@ -1,15 +1,17 @@
 module.exports = (RED) => {
   const fs = require('fs');
-  const net = require('net');
+  const { execFile } = require('child_process');
 
   const RECIPIENTS_FILE = '/tmp/datagateway-alert-recipients.json';
-  // ubus is exposed to local processes through the JSON-RPC proxy
-  // (`ubus-json-server`) — `/var/run/ubus.sock` does not exist on the device.
-  // Mirrors datagateway-api's UBUS_SOCKET_PATH default.
-  const UBUS_SOCKET = '/var/run/ubus-json.sock';
-  // rpcd's own ubus call timeout is 30 s (a roaming SMSC ack can be slow);
-  // leave margin so the server can answer before we give up.
-  const UBUS_TIMEOUT_MS = 35000;
+  // The ubus CLI talks to ubusd directly (its default socket), defaults to a
+  // 30 s call timeout and does not block other ubus clients. The previous
+  // JSON-RPC proxy socket (`ubus-json-server`) hardcoded a 5000 ms timeout,
+  // shorter than an SMS send, so slow sends failed with ubus status 7
+  // (UBUS_STATUS_TIMEOUT) as `{"ok":false,"code":7}`.
+  const UBUS_TIMEOUT_SEC = 30;
+  // Node-side backstop: kill the child if the CLI has not returned by then.
+  // The CLI's own -t is expected to fire first.
+  const KILL_TIMEOUT_MS = 35000;
 
   const failure = (code, message) => {
     const err = new Error(message);
@@ -49,114 +51,94 @@ module.exports = (RED) => {
   };
 
   /**
-   * Calls a ubus object over the JSON-RPC UNIX socket, mirroring
-   * datagateway-api/src/clients/ubusClient.ts:
-   *   → {"jsonrpc":"2.0","method":"call","params":["object","method",{data}]}\n
-   *   ← {"jsonrpc":"2.0","result":[0, values]}
-   * Returns the socket so the node can destroy in-flight calls on close.
+   * Calls the `ubus` CLI:
+   *   ubus [-s <socket>] [-t <timeout>] call sms send '<payload JSON>'
+   * Exit 0: the method result is printed as JSON on stdout (an rpcd-level
+   * error is still exit 0 with a `{"ok":false,"code":...}` body).
+   * Exit >= 128: ubus-level error, exit code = 256 - <ubus status>, stdout
+   * empty and a diagnostic on stderr (249 = timeout, 253 = method not found).
+   * Spawn failure (ENOENT): the binary is not available.
+   * Returns the child process so the node can kill in-flight calls on close.
    */
-  const callUbus = (socketPath, object, method, data, callback) => {
-    const client = new net.Socket();
-    const chunks = [];
+  const callUbus = (bin, socketPath, timeoutSec, payload, callback) => {
+    const args = ['-t', String(timeoutSec)];
+    if (socketPath) {
+      args.push('-s', socketPath);
+    }
+    args.push('call', 'sms', 'send', JSON.stringify(payload));
+
     let done = false;
-    let timer = null;
+    let killTimer = null;
 
     const finish = (err, value) => {
       if (done) return;
       done = true;
-      if (timer) clearTimeout(timer);
-      client.removeAllListeners();
-      client.destroy();
+      if (killTimer) clearTimeout(killTimer);
       callback(err, value);
     };
 
-    const parse = () => {
-      let raw;
-      try {
-        raw = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      } catch (parseErr) {
-        return false; // incomplete response — wait for more data
-      }
-      if (!raw || typeof raw !== 'object' || !('jsonrpc' in raw)) {
-        finish(failure('ubus_error', 'ubus: invalid JSON-RPC response'));
-        return true;
-      }
-      if (raw.error) {
-        finish(failure('ubus_error', `ubus error: ${JSON.stringify(raw.error)}`));
-        return true;
-      }
-      const result = raw.result;
-      if (!Array.isArray(result) || result.length === 0) {
-        finish(failure('ubus_error', 'ubus: empty response'));
-        return true;
-      }
-      if (typeof result[0] === 'number') {
-        if (result[0] !== 0) {
-          finish(failure('ubus_error', `ubus call failed: ${JSON.stringify(result)}`));
+    const child = execFile(bin, args, { encoding: 'utf8' }, (err, stdout, stderr) => {
+      const stderrText = (stderr || '').trim();
+      if (err) {
+        if (err.code === 'ENOENT') {
+          finish(failure('ubus_unavailable', `ubus: cannot execute ${bin}: ${err.message}`));
+        } else if (typeof err.code === 'number' && err.code >= 128) {
+          const status = 256 - err.code;
+          finish(failure(
+            status === 7 ? 'ubus_timeout' : 'ubus_error',
+            stderrText || `ubus call failed with status ${status}`
+          ));
+        } else if (err.signal || err.killed) {
+          finish(failure('ubus_timeout', `ubus: killed after ${KILL_TIMEOUT_MS}ms`));
         } else {
-          finish(null, result[1]);
+          finish(failure('ubus_error', stderrText || `ubus: ${err.message}`));
         }
-      } else {
-        // No status code — treat the first element as the return value.
-        finish(null, result[0]);
+        return;
       }
-      return true;
-    };
 
-    client.on('data', (chunk) => {
-      chunks.push(chunk);
-      parse();
-    });
-
-    client.on('error', (err) => {
-      finish(failure('ubus_error', `ubus: ${err.message}`));
-    });
-
-    client.on('close', () => {
-      if (done) return;
-      if (!parse()) {
+      let reply;
+      try {
+        reply = JSON.parse(stdout);
+      } catch (parseErr) {
         finish(failure('ubus_error', 'ubus: invalid JSON response'));
+        return;
       }
+      if (!reply || typeof reply !== 'object' || Array.isArray(reply)) {
+        finish(failure('ubus_error', 'ubus: invalid JSON response'));
+        return;
+      }
+      finish(null, reply);
     });
 
-    timer = setTimeout(() => {
-      finish(failure('timeout', `ubus: response timeout (${UBUS_TIMEOUT_MS}ms)`));
-    }, UBUS_TIMEOUT_MS);
+    killTimer = setTimeout(() => child.kill(), KILL_TIMEOUT_MS);
 
-    client.connect(socketPath, () => {
-      const message = {
-        jsonrpc: '2.0',
-        method: 'call',
-        params: [object, method, data]
-      };
-      client.end(JSON.stringify(message) + '\n');
-    });
-
-    return client;
+    return child;
   };
 
   function SevioSmsNode(config) {
     RED.nodes.createNode(this, config);
     const node = this;
-    // Overridable in tests (`config.*`) and in the dev harness
-    // (`SEVIO_SMS_UBUS_SOCKET`); the production paths are fixed by the contract.
+    // Overridable in tests (`config.*`) and on the device (`SEVIO_SMS_*`);
+    // production defaults are the bare `ubus` CLI on PATH and no `-s`, since
+    // the CLI's default socket is the real ubusd one.
     const recipientsFile = config.recipientsFile || RECIPIENTS_FILE;
+    const ubusBin = config.ubusBin || process.env.SEVIO_SMS_UBUS_BIN || 'ubus';
     const envSocket = process.env.SEVIO_SMS_UBUS_SOCKET;
-    const ubusSocket = config.ubusSocket || envSocket || UBUS_SOCKET;
+    const ubusSocket = config.ubusSocket || envSocket || '';
     // An env override silently redirects every alert away from the default
     // socket; warn once (per node, at construction) so a misconfigured device
     // is diagnosable from the flow editor. An explicit node config is visible
     // in the flow itself, so only the env-var path warns. Path only — recipient
     // data is never logged.
-    if (!config.ubusSocket && envSocket && envSocket !== UBUS_SOCKET) {
-      const warning = `sevio-sms: using ubus socket ${envSocket} from SEVIO_SMS_UBUS_SOCKET (default: ${UBUS_SOCKET})`;
+    if (!config.ubusSocket && envSocket) {
+      const warning = `sevio-sms: using ubus socket ${envSocket} from SEVIO_SMS_UBUS_SOCKET`;
       if (typeof node.warn === 'function') {
         node.warn(warning);
       } else {
         console.warn(warning);
       }
     }
-    const sockets = new Set();
+    const children = new Set();
     let closed = false;
 
     node.status({ fill: 'blue', shape: 'dot', text: 'ready' });
@@ -209,8 +191,8 @@ module.exports = (RED) => {
             return;
           }
 
-          const socket = callUbus(ubusSocket, 'sms', 'send', { to: [to[index]], body: body }, (ubusErr, result) => {
-            sockets.delete(socket);
+          const child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, { to: [to[index]], body: body }, (ubusErr, result) => {
+            children.delete(child);
             if (closed) return;
             if (ubusErr) {
               fail(ubusErr.code, ubusErr.message);
@@ -227,7 +209,7 @@ module.exports = (RED) => {
               fail(reply.code || 'send_failed', reply.message || 'sms send failed');
             }
           });
-          sockets.add(socket);
+          children.add(child);
         };
 
         sendNext(0);
@@ -236,10 +218,10 @@ module.exports = (RED) => {
 
     node.on('close', function (removed, done) {
       closed = true;
-      for (const socket of sockets) {
-        socket.destroy();
+      for (const child of children) {
+        child.kill();
       }
-      sockets.clear();
+      children.clear();
       done();
     });
   }
