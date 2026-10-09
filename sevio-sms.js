@@ -12,19 +12,34 @@ module.exports = (RED) => {
   // Node-side backstop: kill the child if the CLI has not returned by then.
   // The CLI's own -t is expected to fire first. SIGKILL, not the SIGTERM
   // default: a wedged ubus must not be able to ignore the signal and keep
-  // holding the process-wide queue slot.
+  // holding the process-wide queue slot. Overridable via `config.killTimeoutMs`
+  // or `SEVIO_SMS_KILL_TIMEOUT_MS`.
   const KILL_TIMEOUT_MS = 35000;
   // Watchdog on a held queue slot: force-release it if a run never reaches a
-  // terminal path. Worst case per recipient is KILL_TIMEOUT_MS (35 s) plus the
-  // bounded busy retries (2 s); alert fan-outs are contact lists (1-3 in the
-  // flow's own tests), so 240 s comfortably exceeds any plausible run while
-  // staying below the alert flow's 300 s `alertBusy` stale guard
-  // (ALERT_BUSY_TIMEOUT_MS in datagateway), so this watchdog always fires
-  // first and the queue can not stay wedged past the flow's patience.
+  // terminal path. A `busy` answer is not instant on the rpcd side: rpcd waits
+  // up to LOCK_TRIES=15 x LOCK_SLEEP=0.2 s = 3 s for the modem lock before it
+  // replies, and the node then waits BUSY_RETRY_DELAY_MS before the next
+  // attempt, so the per-recipient worst case is
+  // 2 x (3 s + 1 s) + 35 s = 43 s. Alert fan-outs are contact lists (1-3 in
+  // the flow's own tests), so 240 s comfortably exceeds any plausible run
+  // while staying below the alert flow's 300 s `alertBusy` stale guard
+  // (ALERT_BUSY_TIMEOUT_MS in datagateway). That ordering only holds while
+  // the flow's modbus latency plus the waiting alert's queue wait stay within
+  // the 60 s margin; the 30 s default queue wait leaves 30 s of slack.
+  // Overridable via `config.slotMaxMs` or `SEVIO_SMS_SLOT_MAX_MS`.
   const SLOT_MAX_MS = 240000;
   // How long an input may wait for the slot before failing with
   // `queue_timeout`. The deadline covers the wait only, never a started send.
   const DEFAULT_QUEUE_WAIT_MS = 30000;
+  // setTimeout silently turns anything outside (0, MAX_TIMER_MS] into a ~1 ms
+  // timer (large values are clamped, negative/NaN coerced), so a bad
+  // queueWaitMs would make every contended alert fail `queue_timeout`
+  // instantly instead of waiting.
+  const MAX_TIMER_MS = 2147483647;
+  const normalizeQueueWaitMs = (value) => {
+    const ms = Number(value);
+    return Number.isFinite(ms) && ms > 0 && ms <= MAX_TIMER_MS ? ms : DEFAULT_QUEUE_WAIT_MS;
+  };
   // rpcd answers `busy` before rate_commit/gcom, so retrying it is
   // side-effect-free and costs no rate budget. Every other code is terminal:
   // retrying an ambiguous outcome could send the same SMS twice.
@@ -104,7 +119,7 @@ module.exports = (RED) => {
    * Spawn failure (ENOENT): the binary is not available.
    * Returns the child process so the node can kill in-flight calls on close.
    */
-  const callUbus = (bin, socketPath, timeoutSec, payload, callback) => {
+  const callUbus = (bin, socketPath, timeoutSec, killTimeoutMs, payload, callback) => {
     const args = ['-t', String(timeoutSec)];
     if (socketPath) {
       args.push('-s', socketPath);
@@ -133,7 +148,7 @@ module.exports = (RED) => {
             stderrText || `ubus call failed with status ${status}`
           ));
         } else if (err.signal || err.killed) {
-          finish(failure('ubus_timeout', `ubus: killed after ${KILL_TIMEOUT_MS}ms`));
+          finish(failure('ubus_timeout', `ubus: killed after ${killTimeoutMs}ms`));
         } else {
           finish(failure('ubus_error', stderrText || `ubus: ${err.message}`));
         }
@@ -154,7 +169,7 @@ module.exports = (RED) => {
       finish(null, reply);
     });
 
-    killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_TIMEOUT_MS);
+    killTimer = setTimeout(() => child.kill('SIGKILL'), killTimeoutMs);
 
     return child;
   };
@@ -178,7 +193,7 @@ module.exports = (RED) => {
     clearTimeout(waiter.timer); // the wait is over: queueWaitMs bounds waiting only, never the send
     held = true;
     let released = false;
-    const watchdog = setTimeout(release, SLOT_MAX_MS);
+    const watchdog = setTimeout(release, waiter.slotMaxMs);
     // Idempotent: success, every failure, every closed early-return and the
     // watchdog can all call it; only the first call frees the slot.
     function release() {
@@ -188,21 +203,29 @@ module.exports = (RED) => {
       held = false;
       pump();
     }
-    waiter.start(release);
+    // `isReleased()` turns true when the watchdog reclaimed the slot under a
+    // still-running input: the run must notice and stop sending to later
+    // recipients instead of overlapping the alert that holds the slot now.
+    waiter.start(release, () => released);
   };
 
   /**
-   * Queues `start(release)` for the next free slot. `owner` is the node
-   * instance: its close sweeps out not-yet-started waiters by identity, so a
-   * closed node can never start a send. `onTimeout` fires if the turn does
-   * not come within `waitMs`, with the waiter already removed from the queue
-   * and no slot ever held.
+   * Queues `start(release, isReleased)` for the next free slot. `owner` is the
+   * node instance: its close sweeps out not-yet-started waiters by identity, so
+   * a closed node can never start a send. `slotMaxMs` is the watchdog budget
+   * for the acquired slot (each node passes its own; the shared pump has no
+   * node config). `onTimeout` fires if the turn does not come within `waitMs`,
+   * with the waiter already removed from the queue and no slot ever held.
    */
-  const acquire = (owner, waitMs, start, onTimeout) => {
-    const waiter = { owner: owner, start: start };
+  const acquire = (owner, waitMs, start, onTimeout, slotMaxMs) => {
+    const waiter = { owner: owner, start: start, slotMaxMs: slotMaxMs || SLOT_MAX_MS };
     waiter.timer = setTimeout(() => {
       const i = waiters.indexOf(waiter);
-      if (i >= 0) waiters.splice(i, 1);
+      // Already started or swept by close (both clear the timer first): the
+      // turn is gone, so failing the input here could done() an input that is
+      // not waiting any more.
+      if (i < 0) return;
+      waiters.splice(i, 1);
       onTimeout();
     }, waitMs);
     waiters.push(waiter);
@@ -224,8 +247,18 @@ module.exports = (RED) => {
     const loggerBin = config.loggerBin || process.env.SEVIO_SMS_LOGGER_BIN || 'logger';
     const loggerTag = config.loggerTag || process.env.SEVIO_SMS_LOGGER_TAG || 'sevio-sms';
     // How long an input may wait for the process-wide slot before failing
-    // `queue_timeout`: node config beats env beats the 30 s default.
-    const queueWaitMs = config.queueWaitMs || Number(process.env.SEVIO_SMS_QUEUE_WAIT_MS) || DEFAULT_QUEUE_WAIT_MS;
+    // `queue_timeout`: node config beats env beats the 30 s default. Only a
+    // finite number in (0, 2147483647] is accepted; anything else falls back
+    // to the default rather than becoming a ~1 ms timer.
+    const queueWaitMs = normalizeQueueWaitMs(
+      config.queueWaitMs !== undefined ? config.queueWaitMs : process.env.SEVIO_SMS_QUEUE_WAIT_MS
+    );
+    // Watchdog budget for a held slot (see SLOT_MAX_MS) and Node-side backstop
+    // for a hung ubus child (see KILL_TIMEOUT_MS). Config beats env beats the
+    // default; slotMaxMs travels with each queue wait because the shared pump
+    // has no node config.
+    const slotMaxMs = config.slotMaxMs || Number(process.env.SEVIO_SMS_SLOT_MAX_MS) || SLOT_MAX_MS;
+    const killTimeoutMs = config.killTimeoutMs || Number(process.env.SEVIO_SMS_KILL_TIMEOUT_MS) || KILL_TIMEOUT_MS;
     // An env override silently redirects every alert away from the default
     // socket; warn once (per node, at construction) so a misconfigured device
     // is diagnosable from the flow editor. An explicit node config is visible
@@ -240,6 +273,11 @@ module.exports = (RED) => {
       }
     }
     const children = new Set();
+    // Inputs waiting out the BUSY_RETRY_DELAY_MS retry timer, with their slot's
+    // drop(): on close the timer is cancelled and the slot released at once,
+    // instead of the callback holding the process-wide slot for up to a second
+    // after the node is gone.
+    const retryTimers = new Set();
     let closed = false;
 
     node.status({ fill: 'blue', shape: 'dot', text: 'ready' });
@@ -251,8 +289,10 @@ module.exports = (RED) => {
       // `release` is the queue slot acquired for this input. release() is
       // idempotent and must be called on every terminal path — success, every
       // failure and the closed early-returns — so a failed or aborted send can
-      // never wedge the process-wide queue.
+      // never wedge the process-wide queue. `slotReleased()` is true once the
+      // slot watchdog has freed the slot under this input.
       let release = null;
+      let slotReleased = null;
 
       const fail = (code, message) => {
         if (release) release();
@@ -292,8 +332,9 @@ module.exports = (RED) => {
 
       node.status({ fill: 'blue', shape: 'ring', text: 'sending' });
 
-      acquire(node, queueWaitMs, function (slotRelease) {
+      acquire(node, queueWaitMs, function (slotRelease, isReleased) {
         release = slotRelease;
+        slotReleased = isReleased;
         if (closed) {
           drop();
           return;
@@ -304,6 +345,9 @@ module.exports = (RED) => {
         readRecipients(recipientsFile, alertId, (err, to) => {
           if (closed) {
             drop();
+            return;
+          }
+          if (slotReleased && slotReleased()) {
             return;
           }
           if (err) {
@@ -321,15 +365,24 @@ module.exports = (RED) => {
               drop();
               return;
             }
+            // The watchdog already reclaimed the slot for the next alert: an
+            // abandoned run must not send to another recipient (it would
+            // overlap the alert that holds the slot now).
+            if (slotReleased && slotReleased()) {
+              return;
+            }
             if (index >= to.length) {
               succeed(refs);
               return;
             }
 
-            const child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, { to: [to[index]], body: body }, (ubusErr, result) => {
+            const child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, killTimeoutMs, { to: [to[index]], body: body }, (ubusErr, result) => {
               children.delete(child);
               if (closed) {
                 drop();
+                return;
+              }
+              if (slotReleased && slotReleased()) {
                 return;
               }
               if (ubusErr) {
@@ -358,13 +411,12 @@ module.exports = (RED) => {
               // number of times, per recipient. Every other failure is
               // terminal — retrying an ambiguous outcome risks a duplicate SMS.
               if (code === 'busy' && busyRetries < BUSY_MAX_RETRIES) {
-                setTimeout(() => {
-                  if (closed) {
-                    drop();
-                    return;
-                  }
+                const entry = { timer: null, drop: drop };
+                entry.timer = setTimeout(() => {
+                  retryTimers.delete(entry);
                   sendNext(index, busyRetries + 1);
                 }, BUSY_RETRY_DELAY_MS);
+                retryTimers.add(entry);
                 return;
               }
               fail(code, message);
@@ -376,7 +428,7 @@ module.exports = (RED) => {
         });
       }, () => {
         fail('queue_timeout', `sms queue wait exceeded ${queueWaitMs}ms`);
-      });
+      }, slotMaxMs);
     });
 
     node.on('close', function (removed, done) {
@@ -390,6 +442,13 @@ module.exports = (RED) => {
           waiters.splice(i, 1);
         }
       }
+      // A close during the busy-retry delay must free the slot now, not when
+      // the (up to 1 s) retry timer would have fired.
+      for (const retry of retryTimers) {
+        clearTimeout(retry.timer);
+        retry.drop();
+      }
+      retryTimers.clear();
       for (const child of children) {
         child.kill();
       }

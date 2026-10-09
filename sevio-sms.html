@@ -31,5 +31,15 @@
   <code>/tmp/datagateway-alert-recipients.json</code>, written by datagateway;
   recipient numbers are never stored in the flow.</p>
   <p><b>Output 1 — sent:</b> <code>{ ok: true, ref? }</code>.</p>
-  <p><b>Output 2 — failed:</b> <code>{ ok: false, code, message }</code>.</p>
+  <p><b>Output 2 — failed:</b> <code>{ ok: false, code, message }</code>
+  (e.g. <code>invalid_payload</code>, <code>queue_timeout</code>,
+  <code>recipients_unavailable</code>, <code>no_recipients</code>,
+  <code>busy</code>, <code>ubus_timeout</code>, <code>ubus_unavailable</code>,
+  <code>ubus_error</code>, or the rpcd error code).</p>
+  <p>Sends are serialised process-wide: one alert fan-out holds the send slot
+  at a time and the others queue. If the slot does not free within
+  <code>queueWaitMs</code> (node config, or the
+  <code>SEVIO_SMS_QUEUE_WAIT_MS</code> environment variable; default
+  30000 ms) the input fails with <code>queue_timeout</code> and no
+  <code>ubus</code> call is made. Invalid values fall back to the default.</p>
 </script>

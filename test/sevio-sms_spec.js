@@ -1086,3 +1086,287 @@ test('queue: done() is called exactly once per input on every path', async (t) =
   assert.equal(timeoutResult.doneCalls, 1, 'queue_timeout calls done() once');
   await holdPromise;
 });
+
+test('queue: rpcd timeout, send_failed and not_registered are terminal with exactly one call', async (t) => {
+  for (const code of ['timeout', 'send_failed', 'not_registered']) {
+    const dir = tempDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+    const ubusBin = writeFakeUbus(dir, [
+      { exit: 0, stdout: { ok: false, code: code, message: `rpcd ${code}` } }
+    ]);
+    const node = createNodeFactory()({ name: code, recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+    const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+    assert.equal(err, undefined);
+    // The input resolves on the first failure; any retry would only surface
+    // after BUSY_RETRY_DELAY_MS, so this assertion pins "no retry" for the
+    // codes where a retry could duplicate the SMS.
+    assert.equal(readCalls(dir).length, 1, `${code} must be attempted exactly once`);
+    const [success, failure] = node.sent[0];
+    assert.equal(success, null);
+    assert.deepEqual(failure.payload, { ok: false, code: code, message: `rpcd ${code}` });
+    assert.equal(node.errors.length, 1);
+    assert.equal(node.statusCalls[node.statusCalls.length - 1].fill, 'red');
+  }
+});
+
+test('queue: holder plus two waiters are served in FIFO order', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    hold: ['+390000000001'],
+    w1: ['+390000000002'],
+    w2: ['+390000000003']
+  });
+  const ubusBin = writeFakeUbus(dir, [{ delayMs: 120, stdout: { ok: true, ref: 'ref' } }]);
+  const makeNode = createNodeFactory();
+  const holder = makeNode({ name: 'holder', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const first = makeNode({ name: 'first', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const second = makeNode({ name: 'second', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  const holdPromise = sendInput(holder, { alertId: 'hold', body: 'hold' });
+  await waitFor(() => readCalls(dir).length === 1);
+
+  // Both waiters queue while the holder still owns the slot; the second
+  // submission must not jump the first (a pop() would serve it first).
+  const firstPromise = sendInput(first, { alertId: 'w1', body: 'first' });
+  const secondPromise = sendInput(second, { alertId: 'w2', body: 'second' });
+
+  const [errHold, errFirst, errSecond] = await Promise.all([holdPromise, firstPromise, secondPromise]);
+  assert.equal(errHold, undefined);
+  assert.equal(errFirst, undefined);
+  assert.equal(errSecond, undefined);
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), [
+    '+390000000001', '+390000000002', '+390000000003'
+  ]);
+  assert.equal(holder.sent[0][0].payload.ok, true);
+  assert.equal(first.sent[0][0].payload.ok, true);
+  assert.equal(second.sent[0][0].payload.ok, true);
+});
+
+test('queue: hung ubus child is SIGKILLed after killTimeoutMs', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, [{ hang: true }]);
+
+  const node = createNodeFactory()({
+    name: 'test',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    killTimeoutMs: 200
+  });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.code, 'ubus_timeout');
+  assert.match(failure.payload.message, /killed after 200ms/);
+
+  // SIGKILL cannot be caught: the fake ubus never gets to write its SIGTERM
+  // marker (unlike the child.kill() on the close path) and the pid is gone.
+  const pid = Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8'));
+  await waitFor(() => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (killErr) {
+      return killErr.code === 'ESRCH';
+    }
+  });
+  assert.equal(fs.existsSync(path.join(dir, 'killed')), false, 'a SIGKILLed child cannot record SIGTERM');
+});
+
+test('queue: wedged slot is force-released and the abandoned run stops sending', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    wedged: ['+390000000001', '+390000000002'],
+    next: ['+390000000003']
+  });
+  // The wedged run's first call outlives its slotMaxMs; the second step serves
+  // the alert that takes the force-released slot.
+  const ubusBin = writeFakeUbus(dir, [
+    { delayMs: 300, stdout: { ok: true, ref: 'wedged-1' } },
+    { exit: 0, stdout: { ok: true, ref: 'next' } }
+  ]);
+  const makeNode = createNodeFactory();
+  const wedged = makeNode({
+    name: 'wedged',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    slotMaxMs: 150
+  });
+  const next = makeNode({ name: 'next', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  wedged.emit('input', { payload: { alertId: 'wedged', body: 'wedged' } }, null, () => {});
+  await waitFor(() => readCalls(dir).length === 1);
+
+  const err = await sendInput(next, { alertId: 'next', body: 'next' });
+  assert.equal(err, undefined);
+  assert.deepEqual(next.sent[0][0].payload, { ok: true, ref: 'next' });
+
+  // Let the wedged run's slow call return: the watchdog has already freed its
+  // slot, so it must not start the second recipient.
+  await delay(250);
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), [
+    '+390000000001', '+390000000003'
+  ]);
+  assert.equal(wedged.sent.length, 0, 'the abandoned run produces no output');
+});
+
+test('queue: close during the busy-retry delay drops the slot and cancels the retry', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001'],
+    'b-1': ['+390000000002']
+  });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: false, code: 'busy', message: 'modem busy' } },
+    { exit: 0, stdout: { ok: true, ref: 'next' } }
+  ]);
+  const makeNode = createNodeFactory();
+  // Watchdog long enough not to fire during the test, short enough that a
+  // leaked slot cannot keep a failing run alive for the 240 s default.
+  const busy = makeNode({ name: 'busy', recipientsFile: recipientsFile, ubusBin: ubusBin, slotMaxMs: 5000 });
+  const next = makeNode({ name: 'next', recipientsFile: recipientsFile, ubusBin: ubusBin, queueWaitMs: 300 });
+
+  let busyDoneCalls = 0;
+  busy.emit('input', { payload: { alertId: 'a-1', body: 'busy' } }, null, () => { busyDoneCalls += 1; });
+  await waitFor(() => readCalls(dir).length === 1);
+  await delay(100); // let the busy reply land and the retry timer start
+
+  busy.emit('close', false, () => {});
+
+  // The next sender must get the slot well before the 1 s retry delay; if the
+  // close only stopped the retry without dropping, this would queue_timeout.
+  const err = await sendInput(next, { alertId: 'b-1', body: 'next' });
+  assert.equal(err, undefined);
+  assert.deepEqual(next.sent[0][0].payload, { ok: true, ref: 'next' });
+
+  // The cancelled retry never reaches ubus.
+  await delay(1100);
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), [
+    '+390000000001', '+390000000002'
+  ]);
+  assert.equal(busyDoneCalls, 0, 'a closed node never done()s the dropped input');
+  assert.equal(busy.sent.length, 0);
+  assert.equal(busy.errors.length, 0);
+});
+
+test('queue: close during the readRecipients window drops the slot', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001'],
+    'b-1': ['+390000000002']
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'next' } }]);
+  const makeNode = createNodeFactory();
+  // See the busy-retry close test: keep a leaked slot's watchdog short.
+  const closing = makeNode({ name: 'closing', recipientsFile: recipientsFile, ubusBin: ubusBin, slotMaxMs: 5000 });
+  const next = makeNode({ name: 'next', recipientsFile: recipientsFile, ubusBin: ubusBin, queueWaitMs: 1000 });
+
+  // Hold the closing node's recipients read open so close lands in that window.
+  const originalReadFile = fs.readFile;
+  let gated = true;
+  let readStarted;
+  const started = new Promise((resolve) => { readStarted = resolve; });
+  let releaseRead;
+  const gate = new Promise((resolve) => { releaseRead = resolve; });
+  fs.readFile = function (file, encoding, callback) {
+    if (gated && file === recipientsFile) {
+      gated = false;
+      readStarted();
+      gate.then(() => originalReadFile.call(fs, file, encoding, callback));
+      return;
+    }
+    originalReadFile.call(fs, file, encoding, callback);
+  };
+  t.after(() => { fs.readFile = originalReadFile; });
+
+  let closingDoneCalls = 0;
+  closing.emit('input', { payload: { alertId: 'a-1', body: 'closing' } }, null, () => { closingDoneCalls += 1; });
+  await started;
+  closing.emit('close', false, () => {});
+
+  const nextPromise = sendInput(next, { alertId: 'b-1', body: 'next' });
+  releaseRead();
+
+  const err = await nextPromise;
+  assert.equal(err, undefined);
+  assert.deepEqual(next.sent[0][0].payload, { ok: true, ref: 'next' });
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), ['+390000000002']);
+  assert.equal(closingDoneCalls, 0, 'a closed node never done()s the dropped input');
+  assert.equal(closing.sent.length, 0);
+  assert.equal(closing.errors.length, 0);
+});
+
+test('queue: the busy retry budget is fresh for each recipient', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001', '+390000000002'] });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: false, code: 'busy', message: 'busy 1' } },  // recipient 1, attempt 1
+    { exit: 0, stdout: { ok: true, ref: 'ref-1' } },                     // recipient 1, retry 1
+    { exit: 0, stdout: { ok: false, code: 'busy', message: 'busy 2' } },  // recipient 2, attempt 1
+    { exit: 0, stdout: { ok: false, code: 'busy', message: 'busy 3' } },  // recipient 2, retry 1
+    { exit: 0, stdout: { ok: true, ref: 'ref-2' } }                      // recipient 2, retry 2
+  ]);
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assert.equal(readCalls(dir).length, 5);
+  const [success, failure] = node.sent[0];
+  assert.equal(failure, null);
+  assert.deepEqual(success.payload, { ok: true, ref: 'ref-1,ref-2' });
+});
+
+test('queue: an invalid queueWaitMs falls back to the default wait', async (t) => {
+  const cases = [
+    { name: 'negative config', config: { queueWaitMs: -5 } },
+    { name: 'NaN config', config: { queueWaitMs: 'nope' } },
+    { name: 'config above the setTimeout max', config: { queueWaitMs: 2147483648 } },
+    { name: 'env negative', config: { env: '-5' } }
+  ];
+  for (const testCase of cases) {
+    const dir = tempDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const recipientsFile = writeRecipients(dir, {
+      hold: ['+390000000001'],
+      'a-1': ['+390000000002']
+    });
+    const ubusBin = writeFakeUbus(dir, [{ delayMs: 250, stdout: { ok: true, ref: 'ref' } }]);
+    const makeNode = createNodeFactory();
+    const holder = makeNode({ name: 'holder', recipientsFile: recipientsFile, ubusBin: ubusBin });
+    const waiterConfig = { name: 'waiter', recipientsFile: recipientsFile, ubusBin: ubusBin };
+    if (testCase.config.queueWaitMs !== undefined) {
+      waiterConfig.queueWaitMs = testCase.config.queueWaitMs;
+    }
+    if (testCase.config.env !== undefined) {
+      process.env.SEVIO_SMS_QUEUE_WAIT_MS = testCase.config.env;
+      t.after(() => { delete process.env.SEVIO_SMS_QUEUE_WAIT_MS; });
+    }
+    const waiter = makeNode(waiterConfig);
+
+    const holdPromise = sendInput(holder, { alertId: 'hold', body: 'hold' });
+    await waitFor(() => readCalls(dir).length === 1);
+    const waitPromise = sendInput(waiter, { alertId: 'a-1', body: 'wait' });
+
+    const [errHold, errWait] = await Promise.all([holdPromise, waitPromise]);
+    assert.equal(errHold, undefined);
+    assert.equal(errWait, undefined);
+    assert.equal(
+      waiter.sent[0][1],
+      null,
+      `${testCase.name}: queueWaitMs must fall back to the default, not fire in ~1 ms`
+    );
+    assert.deepEqual(waiter.sent[0][0].payload, { ok: true, ref: 'ref' });
+  }
+});
