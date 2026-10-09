@@ -19,6 +19,32 @@ module.exports = (RED) => {
     return err;
   };
 
+  const oneLine = (value) => String(value).replace(/\s*\n\s*/g, ' ');
+
+  /**
+   * Reports one send attempt and its outcome to syslog through the `logger`
+   * CLI (busybox). Node-RED's stdout is buffered/bursty on the device, so
+   * node.error/node.warn alone do not make a failed send diagnosable from
+   * syslog. The recipient is named by its position in the fan-out (`to=1/2`),
+   * never by number — an MSISDN is never logged. Fire-and-forget: a missing
+   * or failing `logger` must never affect the send. `ref`/`message` are only
+   * included when present.
+   */
+  const logSend = (bin, tag, alertId, index, total, outcome, message, ref) => {
+    let line = `alert=${oneLine(alertId)} to=${index + 1}/${total} outcome=${outcome}`;
+    if (ref !== undefined && ref !== null) {
+      line += ` ref=${oneLine(ref)}`;
+    }
+    if (message !== undefined && message !== null && String(message).trim() !== '') {
+      line += ` message=${oneLine(message)}`;
+    }
+    try {
+      execFile(bin, ['-t', tag, line], () => {});
+    } catch (err) {
+      // Logging must never break a send.
+    }
+  };
+
   /**
    * Resolves recipient numbers for an alert from the datagateway-written file.
    * The resolved numbers are only ever passed to the ubus call — never logged,
@@ -125,6 +151,10 @@ module.exports = (RED) => {
     const ubusBin = config.ubusBin || process.env.SEVIO_SMS_UBUS_BIN || 'ubus';
     const envSocket = process.env.SEVIO_SMS_UBUS_SOCKET;
     const ubusSocket = config.ubusSocket || envSocket || '';
+    // Send outcomes (and only outcomes) are reported to syslog through the
+    // `logger` CLI; binary and tag are overridable like the ubus settings.
+    const loggerBin = config.loggerBin || process.env.SEVIO_SMS_LOGGER_BIN || 'logger';
+    const loggerTag = config.loggerTag || process.env.SEVIO_SMS_LOGGER_TAG || 'sevio-sms';
     // An env override silently redirects every alert away from the default
     // socket; warn once (per node, at construction) so a misconfigured device
     // is diagnosable from the flow editor. An explicit node config is visible
@@ -195,18 +225,25 @@ module.exports = (RED) => {
             children.delete(child);
             if (closed) return;
             if (ubusErr) {
+              logSend(loggerBin, loggerTag, alertId, index, to.length, ubusErr.code, ubusErr.message);
               fail(ubusErr.code, ubusErr.message);
               return;
             }
 
             const reply = result && typeof result === 'object' ? result : {};
             if (reply.ok) {
+              let ref = null;
               if (reply.ref !== undefined && reply.ref !== null) {
+                ref = reply.ref;
                 refs.push(reply.ref);
               }
+              logSend(loggerBin, loggerTag, alertId, index, to.length, 'ok', null, ref);
               sendNext(index + 1);
             } else {
-              fail(reply.code || 'send_failed', reply.message || 'sms send failed');
+              const code = reply.code || 'send_failed';
+              const message = reply.message || 'sms send failed';
+              logSend(loggerBin, loggerTag, alertId, index, to.length, code, message);
+              fail(code, message);
             }
           });
           children.add(child);

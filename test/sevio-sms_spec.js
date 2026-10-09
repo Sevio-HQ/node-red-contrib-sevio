@@ -153,6 +153,53 @@ function waitFor(predicate, timeoutMs = 2000) {
   });
 }
 
+/**
+ * Fake `logger` binary (busybox stand-in). Appends its argv as a JSON line to
+ * <dir>/logger.log so the test can assert the exact syslog invocation
+ * (['-t', <tag>, <line>]).
+ */
+const FAKE_LOGGER_SOURCE = `#!/usr/bin/env node
+'use strict';
+const fs = require('fs');
+const path = require('path');
+
+fs.appendFileSync(path.join(__dirname, 'logger.log'), JSON.stringify(process.argv.slice(2)) + '\\n');
+`;
+
+function writeFakeLogger(dir, name = 'fake-logger') {
+  const bin = path.join(dir, name);
+  fs.writeFileSync(bin, FAKE_LOGGER_SOURCE);
+  fs.chmodSync(bin, 0o755);
+  return bin;
+}
+
+function readLogLines(dir) {
+  const file = path.join(dir, 'logger.log');
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+// The logger is invoked as ['-t', <tag>, <line>]: the syslog line is last.
+function logLines(dir) {
+  return readLogLines(dir).map((argv) => argv[argv.length - 1]);
+}
+
+function assertNoMsisdn(dir, numbers) {
+  for (const argv of readLogLines(dir)) {
+    for (const number of numbers) {
+      assert.equal(
+        argv.join(' ').includes(number),
+        false,
+        `MSISDN leaked into logger line: ${argv.join(' ')}`
+      );
+    }
+  }
+}
+
+// Keep the suite off the host syslog: nodes resolve this stub via
+// SEVIO_SMS_LOGGER_BIN unless a test passes its own loggerBin.
+process.env.SEVIO_SMS_LOGGER_BIN = writeFakeLogger(tempDir());
+
 test('registers the sevio-sms node type', () => {
   const makeNode = createNodeFactory();
   assert.equal(typeof makeNode, 'function');
@@ -552,4 +599,158 @@ test('empty recipient list fails with no_recipients', async (t) => {
   const [success, failure] = node.sent[0];
   assert.equal(success, null);
   assert.equal(failure.payload.code, 'no_recipients');
+});
+
+test('successful send logs one line with the outcome and ref', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const number = '+390000000000';
+  const recipientsFile = writeRecipients(dir, { 'a-1': [number] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+  const loggerBin = writeFakeLogger(dir);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  await waitFor(() => readLogLines(dir).length === 1);
+  assert.deepEqual(readLogLines(dir)[0], [
+    '-t', 'sevio-sms', 'alert=a-1 to=1/1 outcome=ok ref=REF-1'
+  ]);
+  assertNoMsisdn(dir, [number]);
+});
+
+test('multi-recipient fan-out logs one line per recipient', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipients = ['+390000000001', '+390000000002', '+390000000003'];
+  const recipientsFile = writeRecipients(dir, { 'a-1': recipients });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: true, ref: 'ref-1' } },
+    { exit: 0, stdout: { ok: true, ref: 'ref-2' } },
+    { exit: 0, stdout: { ok: true, ref: 'ref-3' } }
+  ]);
+  const loggerBin = writeFakeLogger(dir);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  await waitFor(() => readLogLines(dir).length === recipients.length);
+  assert.deepEqual(logLines(dir).sort(), [
+    'alert=a-1 to=1/3 outcome=ok ref=ref-1',
+    'alert=a-1 to=2/3 outcome=ok ref=ref-2',
+    'alert=a-1 to=3/3 outcome=ok ref=ref-3'
+  ].sort());
+  assertNoMsisdn(dir, recipients);
+});
+
+test('fail-fast abort logs the failed attempt and stops there', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipients = ['+390000000001', '+390000000002', '+390000000003'];
+  const recipientsFile = writeRecipients(dir, { 'a-1': recipients });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: true, ref: 'ref-1' } },
+    { exit: 0, stdout: { ok: false, code: 'send_failed', message: 'second recipient failed' } },
+    { exit: 0, stdout: { ok: true, ref: 'ref-3' } }
+  ]);
+  const loggerBin = writeFakeLogger(dir);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  // Give a stray third attempt time to arrive before asserting the fan-out stopped.
+  await delay(50);
+  await waitFor(() => readLogLines(dir).length === 2);
+  assert.deepEqual(logLines(dir).sort(), [
+    'alert=a-1 to=1/3 outcome=ok ref=ref-1',
+    'alert=a-1 to=2/3 outcome=send_failed message=second recipient failed'
+  ].sort());
+  assertNoMsisdn(dir, recipients);
+});
+
+test('ubus-level timeout logs outcome=ubus_timeout with the stderr message', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const number = '+390000000000';
+  const recipientsFile = writeRecipients(dir, { 'a-1': [number] });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 249, stderr: 'Command failed: ubus call sms send {} (Timeout)\n' }
+  ]);
+  const loggerBin = writeFakeLogger(dir);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  await waitFor(() => readLogLines(dir).length === 1);
+  assert.deepEqual(logLines(dir), [
+    'alert=a-1 to=1/1 outcome=ubus_timeout message=Command failed: ubus call sms send {} (Timeout)'
+  ]);
+  assertNoMsisdn(dir, [number]);
+});
+
+test('a missing logger binary never breaks the send', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000000'] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+
+  const node = createNodeFactory()({
+    name: 'test',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    loggerBin: path.join(dir, 'no-such-logger')
+  });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assert.deepEqual(node.sent[0][0].payload, { ok: true, ref: 'REF-1' });
+  assert.equal(node.errors.length, 0);
+});
+
+test('SEVIO_SMS_LOGGER_BIN supplies the logger binary when config has none', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000000'] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'ENV-REF' } }]);
+  const previousLoggerBin = process.env.SEVIO_SMS_LOGGER_BIN;
+  process.env.SEVIO_SMS_LOGGER_BIN = writeFakeLogger(dir, 'env-logger');
+  t.after(() => {
+    if (previousLoggerBin === undefined) {
+      delete process.env.SEVIO_SMS_LOGGER_BIN;
+    } else {
+      process.env.SEVIO_SMS_LOGGER_BIN = previousLoggerBin;
+    }
+  });
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  await waitFor(() => readLogLines(dir).length === 1);
+  assert.deepEqual(logLines(dir), ['alert=a-1 to=1/1 outcome=ok ref=ENV-REF']);
+});
+
+test('loggerTag overrides the default syslog tag', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000000'] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+  const loggerBin = writeFakeLogger(dir);
+
+  const node = createNodeFactory()({
+    name: 'test',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    loggerBin: loggerBin,
+    loggerTag: 'custom-tag'
+  });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  await waitFor(() => readLogLines(dir).length === 1);
+  assert.equal(readLogLines(dir)[0][1], 'custom-tag');
 });
