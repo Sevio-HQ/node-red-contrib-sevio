@@ -133,6 +133,22 @@ function sendInput(node, payload) {
   });
 }
 
+/**
+ * Like sendInput, but resolves with a mutable result whose `doneCalls` counts
+ * the node's done() invocations: after the test has waited, `doneCalls` must
+ * be exactly 1 on every non-closed path.
+ */
+function sendInputCounting(node, payload) {
+  const result = { doneCalls: 0 };
+  result.promise = new Promise((resolve) => {
+    node.emit('input', { payload: payload }, null, () => {
+      result.doneCalls += 1;
+      resolve(result);
+    });
+  });
+  return result;
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -753,4 +769,320 @@ test('loggerTag overrides the default syslog tag', async (t) => {
   assert.equal(err, undefined);
   await waitFor(() => readLogLines(dir).length === 1);
   assert.equal(readLogLines(dir)[0][1], 'custom-tag');
+});
+
+test('queue: two node instances share one FIFO slot; alerts serialise in submission order', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001', '+390000000002'],
+    'b-1': ['+390000000003']
+  });
+  // Every call lingers: had the two nodes run concurrently, B's call would be
+  // logged while A's fan-out is still waiting on its first recipient.
+  const ubusBin = writeFakeUbus(dir, [{ delayMs: 150, stdout: { ok: true, ref: 'ref' } }]);
+  const makeNode = createNodeFactory();
+  const nodeA = makeNode({ name: 'a', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const nodeB = makeNode({ name: 'b', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  const [errA, errB] = await Promise.all([
+    sendInput(nodeA, { alertId: 'a-1', body: 'first' }),
+    sendInput(nodeB, { alertId: 'b-1', body: 'second' })
+  ]);
+
+  assert.equal(errA, undefined);
+  assert.equal(errB, undefined);
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), [
+    '+390000000001', '+390000000002', '+390000000003'
+  ]);
+  assert.equal(nodeA.sent[0][0].payload.ok, true);
+  assert.equal(nodeB.sent[0][0].payload.ok, true);
+});
+
+test('queue: two alerts submitted together on one node never overlap', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001', '+390000000002'],
+    'b-1': ['+390000000003']
+  });
+  const ubusBin = writeFakeUbus(dir, [{ delayMs: 100, stdout: { ok: true, ref: 'ref' } }]);
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  const [errA, errB] = await Promise.all([
+    sendInput(node, { alertId: 'a-1', body: 'first' }),
+    sendInput(node, { alertId: 'b-1', body: 'second' })
+  ]);
+
+  assert.equal(errA, undefined);
+  assert.equal(errB, undefined);
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), [
+    '+390000000001', '+390000000002', '+390000000003'
+  ]);
+  assert.equal(node.sent.length, 2);
+});
+
+test('queue: recipients are read inside the slot, not at submission time', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    hold: ['+390000000001'],
+    'a-1': ['+390000000001']
+  });
+  const ubusBin = writeFakeUbus(dir, [{ delayMs: 150, stdout: { ok: true, ref: 'ref' } }]);
+  const makeNode = createNodeFactory();
+  const holder = makeNode({ name: 'holder', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const waiter = makeNode({ name: 'waiter', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  const holdPromise = sendInput(holder, { alertId: 'hold', body: 'hold' });
+  await waitFor(() => readCalls(dir).length === 1);
+
+  const waitPromise = sendInput(waiter, { alertId: 'a-1', body: 'fresh' });
+  // The waiter is queued now: rewrite the file before its turn comes.
+  fs.writeFileSync(recipientsFile, JSON.stringify({
+    hold: ['+390000000001'],
+    'a-1': ['+390000000009']
+  }));
+
+  const [errHold, errWait] = await Promise.all([holdPromise, waitPromise]);
+  assert.equal(errHold, undefined);
+  assert.equal(errWait, undefined);
+  const calls = readCalls(dir);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].data.to, ['+390000000009']);
+});
+
+test('queue: waiting past queueWaitMs fails with queue_timeout and makes no ubus call', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001'],
+    'b-1': ['+390000000002']
+  });
+  const ubusBin = writeFakeUbus(dir, [{ delayMs: 400, stdout: { ok: true, ref: 'ref' } }]);
+  const makeNode = createNodeFactory();
+  const holder = makeNode({ name: 'holder', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const waiter = makeNode({ name: 'waiter', recipientsFile: recipientsFile, ubusBin: ubusBin, queueWaitMs: 100 });
+
+  const holdPromise = sendInput(holder, { alertId: 'a-1', body: 'hold' });
+  await waitFor(() => readCalls(dir).length === 1);
+
+  const err = await sendInput(waiter, { alertId: 'b-1', body: 'late' });
+  assert.equal(err, undefined);
+  const [success, failure] = waiter.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.ok, false);
+  assert.equal(failure.payload.code, 'queue_timeout');
+  assert.match(failure.payload.message, /queue/);
+  assert.equal(waiter.errors.length, 1);
+  assert.equal(waiter.statusCalls[waiter.statusCalls.length - 1].fill, 'red');
+
+  await holdPromise;
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), ['+390000000001']);
+
+  // The queue is not wedged: the waiting node can send after the timeout.
+  await sendInput(waiter, { alertId: 'b-1', body: 'after' });
+  assert.deepEqual(waiter.sent[1][0].payload, { ok: true, ref: 'ref' });
+});
+
+test('queue: close while queued cancels the waiter without sending or done()', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001'],
+    'b-1': ['+390000000002']
+  });
+  const ubusBin = writeFakeUbus(dir, [{ delayMs: 300, stdout: { ok: true, ref: 'ref' } }]);
+  const makeNode = createNodeFactory();
+  const holder = makeNode({ name: 'holder', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const queued = makeNode({ name: 'queued', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  const holdPromise = sendInput(holder, { alertId: 'a-1', body: 'hold' });
+  await waitFor(() => readCalls(dir).length === 1);
+
+  let queuedDoneCalls = 0;
+  queued.emit('input', { payload: { alertId: 'b-1', body: 'queued' } }, null, () => { queuedDoneCalls += 1; });
+  queued.emit('close', false, () => {});
+
+  await holdPromise;
+  await delay(50);
+
+  assert.equal(queuedDoneCalls, 0, 'a cancelled waiter is never done()');
+  assert.equal(queued.sent.length, 0);
+  assert.equal(queued.errors.length, 0);
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), ['+390000000001']);
+
+  // The surviving node still gets the slot afterwards.
+  await sendInput(holder, { alertId: 'b-1', body: 'after' });
+  assert.equal(holder.sent[1][0].payload.ok, true);
+});
+
+test('queue: close while in flight frees the slot for the next sender', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001'],
+    'b-1': ['+390000000002']
+  });
+  const ubusBin = writeFakeUbus(dir, [
+    { hang: true },
+    { exit: 0, stdout: { ok: true, ref: 'next' } }
+  ]);
+  const makeNode = createNodeFactory();
+  const inFlight = makeNode({ name: 'in-flight', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const next = makeNode({ name: 'next', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  let inFlightDoneCalls = 0;
+  inFlight.emit('input', { payload: { alertId: 'a-1', body: 'hang' } }, null, () => { inFlightDoneCalls += 1; });
+  await waitFor(() => fs.existsSync(path.join(dir, 'pid')));
+
+  inFlight.emit('close', false, () => {});
+
+  // The killed child's callback lands on a closed early-return, which must
+  // release the global slot before the next sender's queue wait expires.
+  const err = await sendInput(next, { alertId: 'b-1', body: 'next' });
+  assert.equal(err, undefined);
+  assert.deepEqual(next.sent[0][0].payload, { ok: true, ref: 'next' });
+  assert.equal(fs.existsSync(path.join(dir, 'killed')), true);
+  assert.equal(inFlightDoneCalls, 0);
+  assert.equal(inFlight.sent.length, 0);
+  assert.equal(inFlight.errors.length, 0);
+});
+
+test('queue: every failure path releases the slot', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 253, stderr: 'Command failed: ubus call sms send {} (Method not found)\n' },
+    { exit: 0, stdout: { ok: true, ref: 'recovered' } }
+  ]);
+  const makeNode = createNodeFactory();
+  // A short queue wait turns any leaked slot into a quick, loud failure.
+  const noFile = makeNode({
+    name: 'no-file',
+    recipientsFile: path.join(dir, 'missing.json'),
+    ubusBin: ubusBin,
+    queueWaitMs: 300
+  });
+  const flaky = makeNode({ name: 'flaky', recipientsFile: recipientsFile, ubusBin: ubusBin, queueWaitMs: 300 });
+  const good = makeNode({ name: 'good', recipientsFile: recipientsFile, ubusBin: ubusBin, queueWaitMs: 300 });
+
+  // 1. recipients_unavailable: fails before any ubus call.
+  await sendInput(noFile, { alertId: 'a-1', body: 'one' });
+  assert.equal(noFile.sent[0][1].payload.code, 'recipients_unavailable');
+
+  // 2. ubus_error: ubus-level failure on the first attempt.
+  await sendInput(flaky, { alertId: 'a-1', body: 'two' });
+  assert.equal(flaky.sent[0][1].payload.code, 'ubus_error');
+
+  // 3. A following sender still gets the slot.
+  await sendInput(good, { alertId: 'a-1', body: 'three' });
+  assert.deepEqual(good.sent[0][0].payload, { ok: true, ref: 'recovered' });
+  assert.equal(readCalls(dir).length, 2);
+});
+
+test('queue: a busy reply is retried (bounded) and can succeed', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: false, code: 'busy', message: 'modem busy' } },
+    { exit: 0, stdout: { ok: true, ref: 'after-busy' } }
+  ]);
+  const loggerBin = writeFakeLogger(dir);
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assert.equal(readCalls(dir).length, 2);
+  assert.deepEqual(node.sent[0][0].payload, { ok: true, ref: 'after-busy' });
+  await waitFor(() => readLogLines(dir).length === 2);
+  assert.deepEqual(logLines(dir), [
+    'alert=a-1 to=1/1 outcome=busy message=modem busy',
+    'alert=a-1 to=1/1 outcome=ok ref=after-busy'
+  ]);
+});
+
+test('queue: busy exhausting the bounded retries surfaces the failure', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: false, code: 'busy', message: 'still busy' } }]);
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assert.equal(readCalls(dir).length, 3); // 1 attempt + 2 bounded retries
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.deepEqual(failure.payload, { ok: false, code: 'busy', message: 'still busy' });
+});
+
+test('queue: ubus_timeout and rate_limited are terminal, never retried', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001'],
+    'a-2': ['+390000000002']
+  });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 249, stderr: 'Command failed: ubus call sms send {} (Timeout)\n' },
+    { exit: 0, stdout: { ok: false, code: 'rate_limited', message: 'too many sms' } }
+  ]);
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+
+  await sendInput(node, { alertId: 'a-1', body: 'one' });
+  await sendInput(node, { alertId: 'a-2', body: 'two' });
+
+  assert.equal(readCalls(dir).length, 2); // exactly one attempt each
+  assert.equal(node.sent[0][1].payload.code, 'ubus_timeout');
+  assert.equal(node.sent[1][1].payload.code, 'rate_limited');
+});
+
+test('queue: done() is called exactly once per input on every path', async (t) => {
+  const dir = tempDir();
+  const ubusDir = tempDir();
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(ubusDir, { recursive: true, force: true });
+  });
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const okUbus = writeFakeUbus(ubusDir, [{ delayMs: 100, stdout: { ok: true, ref: 'r' } }]);
+  const failUbus = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: false, code: 'send_failed', message: 'nope' } }]);
+  const makeNode = createNodeFactory();
+
+  // success
+  const okNode = makeNode({ name: 'ok', recipientsFile: recipientsFile, ubusBin: okUbus });
+  const okResult = await sendInputCounting(okNode, { alertId: 'a-1', body: 'x' }).promise;
+  await delay(50);
+  assert.equal(okResult.doneCalls, 1, 'success calls done() once');
+
+  // rpcd failure
+  const failNode = makeNode({ name: 'fail', recipientsFile: recipientsFile, ubusBin: failUbus });
+  const failResult = await sendInputCounting(failNode, { alertId: 'a-1', body: 'x' }).promise;
+  await delay(50);
+  assert.equal(failResult.doneCalls, 1, 'a failure calls done() once');
+
+  // invalid payload (never queued)
+  const invalidResult = await sendInputCounting(okNode, { body: 'x' }).promise;
+  await delay(50);
+  assert.equal(invalidResult.doneCalls, 1, 'an invalid payload calls done() once');
+
+  // queue timeout
+  const holder = makeNode({ name: 'holder', recipientsFile: recipientsFile, ubusBin: okUbus });
+  const holdPromise = sendInput(holder, { alertId: 'a-1', body: 'hold' });
+  await waitFor(() => readCalls(ubusDir).length === 1);
+  const waiter = makeNode({
+    name: 'waiter',
+    recipientsFile: recipientsFile,
+    ubusBin: okUbus,
+    queueWaitMs: 50
+  });
+  const timeoutResult = await sendInputCounting(waiter, { alertId: 'a-1', body: 'late' }).promise;
+  await delay(50);
+  assert.equal(timeoutResult.doneCalls, 1, 'queue_timeout calls done() once');
+  await holdPromise;
 });

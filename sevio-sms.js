@@ -10,8 +10,26 @@ module.exports = (RED) => {
   // (UBUS_STATUS_TIMEOUT) as `{"ok":false,"code":7}`.
   const UBUS_TIMEOUT_SEC = 30;
   // Node-side backstop: kill the child if the CLI has not returned by then.
-  // The CLI's own -t is expected to fire first.
+  // The CLI's own -t is expected to fire first. SIGKILL, not the SIGTERM
+  // default: a wedged ubus must not be able to ignore the signal and keep
+  // holding the process-wide queue slot.
   const KILL_TIMEOUT_MS = 35000;
+  // Watchdog on a held queue slot: force-release it if a run never reaches a
+  // terminal path. Worst case per recipient is KILL_TIMEOUT_MS (35 s) plus the
+  // bounded busy retries (2 s); alert fan-outs are contact lists (1-3 in the
+  // flow's own tests), so 240 s comfortably exceeds any plausible run while
+  // staying below the alert flow's 300 s `alertBusy` stale guard
+  // (ALERT_BUSY_TIMEOUT_MS in datagateway), so this watchdog always fires
+  // first and the queue can not stay wedged past the flow's patience.
+  const SLOT_MAX_MS = 240000;
+  // How long an input may wait for the slot before failing with
+  // `queue_timeout`. The deadline covers the wait only, never a started send.
+  const DEFAULT_QUEUE_WAIT_MS = 30000;
+  // rpcd answers `busy` before rate_commit/gcom, so retrying it is
+  // side-effect-free and costs no rate budget. Every other code is terminal:
+  // retrying an ambiguous outcome could send the same SMS twice.
+  const BUSY_MAX_RETRIES = 2;
+  const BUSY_RETRY_DELAY_MS = 1000;
 
   const failure = (code, message) => {
     const err = new Error(message);
@@ -136,9 +154,59 @@ module.exports = (RED) => {
       finish(null, reply);
     });
 
-    killTimer = setTimeout(() => child.kill(), KILL_TIMEOUT_MS);
+    killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_TIMEOUT_MS);
 
     return child;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Process-wide send queue
+  //
+  // This factory body runs once per Node-RED process (the module is required
+  // once and the factory called once per node set), so `waiters`/`held` below
+  // serialise every `sevio-sms` node in the process: at most one alert
+  // fan-out touches the modem at a time. A slot holds a whole fan-out, not a
+  // single ubus call — the fan-out is one logical alert and its per-recipient
+  // calls must not interleave with another alert's.
+  // ---------------------------------------------------------------------------
+  const waiters = [];
+  let held = false;
+
+  const pump = () => {
+    if (held || waiters.length === 0) return;
+    const waiter = waiters.shift();
+    clearTimeout(waiter.timer); // the wait is over: queueWaitMs bounds waiting only, never the send
+    held = true;
+    let released = false;
+    const watchdog = setTimeout(release, SLOT_MAX_MS);
+    // Idempotent: success, every failure, every closed early-return and the
+    // watchdog can all call it; only the first call frees the slot.
+    function release() {
+      if (released) return;
+      released = true;
+      clearTimeout(watchdog);
+      held = false;
+      pump();
+    }
+    waiter.start(release);
+  };
+
+  /**
+   * Queues `start(release)` for the next free slot. `owner` is the node
+   * instance: its close sweeps out not-yet-started waiters by identity, so a
+   * closed node can never start a send. `onTimeout` fires if the turn does
+   * not come within `waitMs`, with the waiter already removed from the queue
+   * and no slot ever held.
+   */
+  const acquire = (owner, waitMs, start, onTimeout) => {
+    const waiter = { owner: owner, start: start };
+    waiter.timer = setTimeout(() => {
+      const i = waiters.indexOf(waiter);
+      if (i >= 0) waiters.splice(i, 1);
+      onTimeout();
+    }, waitMs);
+    waiters.push(waiter);
+    pump();
   };
 
   function SevioSmsNode(config) {
@@ -155,6 +223,9 @@ module.exports = (RED) => {
     // `logger` CLI; binary and tag are overridable like the ubus settings.
     const loggerBin = config.loggerBin || process.env.SEVIO_SMS_LOGGER_BIN || 'logger';
     const loggerTag = config.loggerTag || process.env.SEVIO_SMS_LOGGER_TAG || 'sevio-sms';
+    // How long an input may wait for the process-wide slot before failing
+    // `queue_timeout`: node config beats env beats the 30 s default.
+    const queueWaitMs = config.queueWaitMs || Number(process.env.SEVIO_SMS_QUEUE_WAIT_MS) || DEFAULT_QUEUE_WAIT_MS;
     // An env override silently redirects every alert away from the default
     // socket; warn once (per node, at construction) so a misconfigured device
     // is diagnosable from the flow editor. An explicit node config is visible
@@ -177,12 +248,37 @@ module.exports = (RED) => {
       send = send || node.send.bind(node);
       done = done || function () {};
 
+      // `release` is the queue slot acquired for this input. release() is
+      // idempotent and must be called on every terminal path — success, every
+      // failure and the closed early-returns — so a failed or aborted send can
+      // never wedge the process-wide queue.
+      let release = null;
+
       const fail = (code, message) => {
+        if (release) release();
         if (closed) return;
         node.status({ fill: 'red', shape: 'dot', text: code });
         node.error(message, msg);
         send([null, Object.assign({}, msg, { payload: { ok: false, code: code, message: message } })]);
         done();
+      };
+
+      const succeed = (refs) => {
+        if (release) release();
+        if (closed) return;
+        const out = Object.assign({}, msg, { payload: { ok: true } });
+        if (refs.length > 0) {
+          out.payload.ref = refs.join(',');
+        }
+        node.status({ fill: 'green', shape: 'dot', text: 'sent' });
+        send([out, null]);
+        done();
+      };
+
+      // A slot held when the node closes is dropped without any output or
+      // done(): Node-RED has already closed the node and drops both.
+      const drop = () => {
+        if (release) release();
       };
 
       const payload = msg.payload;
@@ -196,65 +292,104 @@ module.exports = (RED) => {
 
       node.status({ fill: 'blue', shape: 'ring', text: 'sending' });
 
-      readRecipients(recipientsFile, alertId, (err, to) => {
-        if (closed) return;
-        if (err) {
-          fail(err.code, err.message);
+      acquire(node, queueWaitMs, function (slotRelease) {
+        release = slotRelease;
+        if (closed) {
+          drop();
           return;
         }
 
-        // One ubus call per recipient: rpcd's sms service has a 30 s exec
-        // timeout and a single send can take ~22 s worst case, so a combined
-        // call could be killed mid-flight. Fail-fast on the first recipient
-        // that fails; only report success once all of them have succeeded.
-        const refs = [];
-        const sendNext = (index) => {
-          if (closed) return;
-          if (index >= to.length) {
-            const out = Object.assign({}, msg, { payload: { ok: true } });
-            if (refs.length > 0) {
-              out.payload.ref = refs.join(',');
-            }
-            node.status({ fill: 'green', shape: 'dot', text: 'sent' });
-            send([out, null]);
-            done();
+        // Recipients are resolved inside the slot: a queued alert reads the
+        // file at send time, not at submission time.
+        readRecipients(recipientsFile, alertId, (err, to) => {
+          if (closed) {
+            drop();
+            return;
+          }
+          if (err) {
+            fail(err.code, err.message);
             return;
           }
 
-          const child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, { to: [to[index]], body: body }, (ubusErr, result) => {
-            children.delete(child);
-            if (closed) return;
-            if (ubusErr) {
-              logSend(loggerBin, loggerTag, alertId, index, to.length, ubusErr.code, ubusErr.message);
-              fail(ubusErr.code, ubusErr.message);
+          // One ubus call per recipient: rpcd's sms service has a 30 s exec
+          // timeout and a single send can take ~22 s worst case, so a combined
+          // call could be killed mid-flight. Fail-fast on the first recipient
+          // that fails; only report success once all of them have succeeded.
+          const refs = [];
+          const sendNext = (index, busyRetries) => {
+            if (closed) {
+              drop();
+              return;
+            }
+            if (index >= to.length) {
+              succeed(refs);
               return;
             }
 
-            const reply = result && typeof result === 'object' ? result : {};
-            if (reply.ok) {
-              let ref = null;
-              if (reply.ref !== undefined && reply.ref !== null) {
-                ref = reply.ref;
-                refs.push(reply.ref);
+            const child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, { to: [to[index]], body: body }, (ubusErr, result) => {
+              children.delete(child);
+              if (closed) {
+                drop();
+                return;
               }
-              logSend(loggerBin, loggerTag, alertId, index, to.length, 'ok', null, ref);
-              sendNext(index + 1);
-            } else {
+              if (ubusErr) {
+                logSend(loggerBin, loggerTag, alertId, index, to.length, ubusErr.code, ubusErr.message);
+                fail(ubusErr.code, ubusErr.message);
+                return;
+              }
+
+              const reply = result && typeof result === 'object' ? result : {};
+              if (reply.ok) {
+                let ref = null;
+                if (reply.ref !== undefined && reply.ref !== null) {
+                  ref = reply.ref;
+                  refs.push(reply.ref);
+                }
+                logSend(loggerBin, loggerTag, alertId, index, to.length, 'ok', null, ref);
+                sendNext(index + 1, 0);
+                return;
+              }
+
               const code = reply.code || 'send_failed';
               const message = reply.message || 'sms send failed';
               logSend(loggerBin, loggerTag, alertId, index, to.length, code, message);
+              // `busy` is answered before rate_commit/gcom, so it is
+              // side-effect-free and costs no rate budget: retry it a bounded
+              // number of times, per recipient. Every other failure is
+              // terminal — retrying an ambiguous outcome risks a duplicate SMS.
+              if (code === 'busy' && busyRetries < BUSY_MAX_RETRIES) {
+                setTimeout(() => {
+                  if (closed) {
+                    drop();
+                    return;
+                  }
+                  sendNext(index, busyRetries + 1);
+                }, BUSY_RETRY_DELAY_MS);
+                return;
+              }
               fail(code, message);
-            }
-          });
-          children.add(child);
-        };
+            });
+            children.add(child);
+          };
 
-        sendNext(0);
+          sendNext(0, 0);
+        });
+      }, () => {
+        fail('queue_timeout', `sms queue wait exceeded ${queueWaitMs}ms`);
       });
     });
 
     node.on('close', function (removed, done) {
       closed = true;
+      // Cancel this node's queued-but-not-started waiters: a closed node must
+      // never start a send. In-flight children are killed below; their
+      // callbacks land on the closed early-returns above and free the slot.
+      for (let i = waiters.length - 1; i >= 0; i -= 1) {
+        if (waiters[i].owner === node) {
+          clearTimeout(waiters[i].timer);
+          waiters.splice(i, 1);
+        }
+      }
       for (const child of children) {
         child.kill();
       }
