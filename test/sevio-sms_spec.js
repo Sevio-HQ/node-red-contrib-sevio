@@ -771,6 +771,99 @@ test('loggerTag overrides the default syslog tag', async (t) => {
   assert.equal(readLogLines(dir)[0][1], 'custom-tag');
 });
 
+test('charset: uncarriable characters are dropped from the sent body, in place, and the strip is logged once', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipients = ['+390000000001', '+390000000002'];
+  const recipientsFile = writeRecipients(dir, { 'a-1': recipients });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: true, ref: 'ref-1' } },
+    { exit: 0, stdout: { ok: true, ref: 'ref-2' } }
+  ]);
+  const loggerBin = writeFakeLogger(dir);
+  const body = 'Livello € carburante basso — trattore 12 è fermo';
+  const expected = 'Livello  carburante basso  trattore 12  fermo';
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: body });
+
+  assert.equal(err, undefined);
+  const calls = readCalls(dir);
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    // Exact bytes: only €, — and è are gone; every other byte, and the tail,
+    // survives in order.
+    assert.equal(
+      Buffer.compare(Buffer.from(call.data.body, 'utf8'), Buffer.from(expected, 'utf8')),
+      0,
+      `sent body bytes differ: ${JSON.stringify(call.data.body)}`
+    );
+  }
+  // One strip warning per alert (not per recipient) plus two outcome lines.
+  await waitFor(() => readLogLines(dir).length === 3);
+  assert.deepEqual(logLines(dir).sort(), [
+    'alert=a-1 outcome=charset_stripped removed=3 chars="€—è"',
+    'alert=a-1 to=1/2 outcome=ok ref=ref-1',
+    'alert=a-1 to=2/2 outcome=ok ref=ref-2'
+  ].sort());
+  assertNoMsisdn(dir, recipients);
+});
+
+test('charset: a printable-ASCII body — GSM extension characters included — is sent byte-identical and never logged', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+  const loggerBin = writeFakeLogger(dir);
+  // Every printable ASCII code point, prefixed with the GSM extension
+  // characters that must not be mistaken for uncarriable ones.
+  const allPrintable = Array.from(
+    { length: 0x7e - 0x20 + 1 },
+    (_, i) => String.fromCharCode(0x20 + i)
+  ).join('');
+  const body = `[ ] { } \\ ~ | ^ ${allPrintable}`;
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: body });
+
+  assert.equal(err, undefined);
+  const calls = readCalls(dir);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].data.body, body);
+  assert.equal(
+    Buffer.compare(Buffer.from(calls[0].data.body, 'utf8'), Buffer.from(body, 'utf8')),
+    0,
+    'a printable-ASCII body must reach ubus byte-identical'
+  );
+  // Exactly one log line — the outcome. No strip warning when nothing was removed.
+  await waitFor(() => readLogLines(dir).length === 1);
+  await delay(50); // give a stray strip warning time to arrive
+  assert.deepEqual(logLines(dir), ['alert=a-1 to=1/1 outcome=ok ref=REF-1']);
+});
+
+test('charset: control characters are stripped too and named with escapes in the warning', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+  const loggerBin = writeFakeLogger(dir);
+  const body = 'Low\nFuel\ttractor\u000712';
+  const expected = 'LowFueltractor12';
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: body });
+
+  assert.equal(err, undefined);
+  const calls = readCalls(dir);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].data.body, expected);
+  await waitFor(() => readLogLines(dir).length === 2);
+  assert.deepEqual(logLines(dir).sort(), [
+    'alert=a-1 outcome=charset_stripped removed=3 chars="\\n\\t\\u0007"',
+    'alert=a-1 to=1/1 outcome=ok ref=REF-1'
+  ].sort());
+});
+
 test('queue: two node instances share one FIFO slot; alerts serialise in submission order', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

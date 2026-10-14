@@ -79,6 +79,58 @@ module.exports = (RED) => {
   };
 
   /**
+   * The device runs AT+CSCS="IRA": the modem maps each incoming byte onto the
+   * GSM alphabet, so only printable ASCII (0x20-0x7E) arrives as sent. Every
+   * other character is uncarriable — non-ASCII is multi-byte UTF-8 (the modem
+   * maps each byte separately: '€' arrives as spaces, an accent as another
+   * letter) and control characters have no safe mapping. `[ ] { } \ ~ | ^`
+   * are printable ASCII and deliberately kept: as GSM extension characters
+   * they cost two septets each, but they are deliverable. Removes each
+   * uncarriable character in place (never a tail truncation) and returns the
+   * stripped body plus the removed characters in order, so a warning can
+   * name them.
+   */
+  const sanitizeBody = (body) => {
+    let stripped = '';
+    const removed = [];
+    for (const ch of body) {
+      const code = ch.codePointAt(0);
+      if (code >= 0x20 && code <= 0x7e) {
+        stripped += ch;
+      } else {
+        removed.push(ch);
+      }
+    }
+    return { body: stripped, removed: removed };
+  };
+
+  /**
+   * Reports a body charset strip to syslog through the same `logger` path as
+   * send outcomes: a strip changes what is sent, so it must never be silent.
+   * The removed characters are named once each (order of first appearance),
+   * capped, and JSON-quoted so a control character cannot break the single
+   * syslog line. Fire-and-forget, like logSend.
+   */
+  const logStrip = (bin, tag, alertId, removed) => {
+    const distinct = [];
+    for (const ch of removed) {
+      if (distinct.indexOf(ch) < 0) distinct.push(ch);
+    }
+    const MAX_NAMED = 20;
+    const named = distinct.slice(0, MAX_NAMED);
+    let chars = JSON.stringify(named.join(''));
+    if (distinct.length > named.length) {
+      chars += ` (+${distinct.length - named.length} more)`;
+    }
+    const line = `alert=${oneLine(alertId)} outcome=charset_stripped removed=${removed.length} chars=${chars}`;
+    try {
+      execFile(bin, ['-t', tag, line], () => {});
+    } catch (err) {
+      // Logging must never break a send.
+    }
+  };
+
+  /**
    * Resolves recipient numbers for an alert from the datagateway-written file.
    * The resolved numbers are only ever passed to the ubus call — never logged,
    * never included in status or error messages.
@@ -242,8 +294,9 @@ module.exports = (RED) => {
     const ubusBin = config.ubusBin || process.env.SEVIO_SMS_UBUS_BIN || 'ubus';
     const envSocket = process.env.SEVIO_SMS_UBUS_SOCKET;
     const ubusSocket = config.ubusSocket || envSocket || '';
-    // Send outcomes (and only outcomes) are reported to syslog through the
-    // `logger` CLI; binary and tag are overridable like the ubus settings.
+    // Send outcomes and body charset strips (and nothing else) are reported
+    // to syslog through the `logger` CLI; binary and tag are overridable like
+    // the ubus settings.
     const loggerBin = config.loggerBin || process.env.SEVIO_SMS_LOGGER_BIN || 'logger';
     const loggerTag = config.loggerTag || process.env.SEVIO_SMS_LOGGER_TAG || 'sevio-sms';
     // How long an input may wait for the process-wide slot before failing
@@ -355,6 +408,19 @@ module.exports = (RED) => {
             return;
           }
 
+          // The modem maps each byte onto the GSM alphabet (AT+CSCS="IRA"),
+          // so only printable ASCII is deliverable. Strip every other
+          // character here, once per alert (the fan-out sends the same body
+          // to every recipient), before the first ubus call. Never a
+          // rejection — the backend blocks uncarriable bodies at save, this
+          // is the defensive path for bodies that already exist — and never
+          // a tail truncation: the rest of the text survives in order. The
+          // strip is logged so a mangled-by-design send is never silent.
+          const sanitized = sanitizeBody(body);
+          if (sanitized.removed.length > 0) {
+            logStrip(loggerBin, loggerTag, alertId, sanitized.removed);
+          }
+
           // One ubus call per recipient: rpcd's sms service has a 30 s exec
           // timeout and a single send can take ~22 s worst case, so a combined
           // call could be killed mid-flight. Fail-fast on the first recipient
@@ -376,7 +442,7 @@ module.exports = (RED) => {
               return;
             }
 
-            const child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, killTimeoutMs, { to: [to[index]], body: body }, (ubusErr, result) => {
+            const child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, killTimeoutMs, { to: [to[index]], body: sanitized.body }, (ubusErr, result) => {
               children.delete(child);
               if (closed) {
                 drop();
