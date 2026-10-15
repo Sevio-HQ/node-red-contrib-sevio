@@ -771,7 +771,7 @@ test('loggerTag overrides the default syslog tag', async (t) => {
   assert.equal(readLogLines(dir)[0][1], 'custom-tag');
 });
 
-test('charset: uncarriable characters are dropped from the sent body, in place, and the strip is logged once', async (t) => {
+test('charset: a mixed body truncates at the first uncarriable character, with dots appended, and the truncation is logged once', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const recipients = ['+390000000001', '+390000000002'];
@@ -782,7 +782,7 @@ test('charset: uncarriable characters are dropped from the sent body, in place, 
   ]);
   const loggerBin = writeFakeLogger(dir);
   const body = 'Livello € carburante basso — trattore 12 è fermo';
-  const expected = 'Livello  carburante basso  trattore 12  fermo';
+  const expected = 'Livello ...'; // everything from the € on is gone; not '... basso...'
 
   const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
   const err = await sendInput(node, { alertId: 'a-1', body: body });
@@ -791,25 +791,28 @@ test('charset: uncarriable characters are dropped from the sent body, in place, 
   const calls = readCalls(dir);
   assert.equal(calls.length, 2);
   for (const call of calls) {
-    // Exact bytes: only €, — and è are gone; every other byte, and the tail,
-    // survives in order.
+    // Exact bytes: the tail from the first uncarriable character on is gone,
+    // replaced by three ASCII dots. Nothing after that character survives.
     assert.equal(
       Buffer.compare(Buffer.from(call.data.body, 'utf8'), Buffer.from(expected, 'utf8')),
       0,
       `sent body bytes differ: ${JSON.stringify(call.data.body)}`
     );
   }
-  // One strip warning per alert (not per recipient) plus two outcome lines.
+  // One truncation warning per alert (not per recipient) plus two outcome
+  // lines; the warning names the trigger and the 40 dropped characters
+  // (48 total code points minus the 8 kept).
   await waitFor(() => readLogLines(dir).length === 3);
+  await delay(50); // give a stray second warning time to arrive
   assert.deepEqual(logLines(dir).sort(), [
-    'alert=a-1 outcome=charset_stripped removed=3 chars="€—è"',
+    'alert=a-1 outcome=body_truncated trigger="€" dropped=40',
     'alert=a-1 to=1/2 outcome=ok ref=ref-1',
     'alert=a-1 to=2/2 outcome=ok ref=ref-2'
   ].sort());
   assertNoMsisdn(dir, recipients);
 });
 
-test('charset: a printable-ASCII body — GSM extension characters included — is sent byte-identical and never logged', async (t) => {
+test('charset: a printable-ASCII body — GSM extension characters included — is sent completely unmodified, with no dots and no warning', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
@@ -835,20 +838,21 @@ test('charset: a printable-ASCII body — GSM extension characters included — 
     0,
     'a printable-ASCII body must reach ubus byte-identical'
   );
-  // Exactly one log line — the outcome. No strip warning when nothing was removed.
+  assert.equal(calls[0].data.body.endsWith('...'), false, 'a clean body must not gain trailing dots');
+  // Exactly one log line — the outcome. No truncation warning when nothing was cut.
   await waitFor(() => readLogLines(dir).length === 1);
-  await delay(50); // give a stray strip warning time to arrive
+  await delay(50); // give a stray truncation warning time to arrive
   assert.deepEqual(logLines(dir), ['alert=a-1 to=1/1 outcome=ok ref=REF-1']);
 });
 
-test('charset: control characters are stripped too and named with escapes in the warning', async (t) => {
+test('charset: a control character truncates the body too, named with escapes in the warning', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
   const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
   const loggerBin = writeFakeLogger(dir);
   const body = 'Low\nFuel\ttractor\u000712';
-  const expected = 'LowFueltractor12';
+  const expected = 'Low...'; // the \n is the first uncarriable character
 
   const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
   const err = await sendInput(node, { alertId: 'a-1', body: body });
@@ -859,7 +863,66 @@ test('charset: control characters are stripped too and named with escapes in the
   assert.equal(calls[0].data.body, expected);
   await waitFor(() => readLogLines(dir).length === 2);
   assert.deepEqual(logLines(dir).sort(), [
-    'alert=a-1 outcome=charset_stripped removed=3 chars="\\n\\t\\u0007"',
+    'alert=a-1 outcome=body_truncated trigger="\\n" dropped=16',
+    'alert=a-1 to=1/1 outcome=ok ref=REF-1'
+  ].sort());
+});
+
+test('charset: a bad character late in a near-160-septet body truncates the prefix until the result fits the budget', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+  const loggerBin = writeFakeLogger(dir);
+  // 158 printable septets, then the bad character: 158 + 3 dots would be 161,
+  // one septet over the 160 budget, so the kept prefix loses one character.
+  const body = 'a'.repeat(158) + '€';
+  const expected = 'a'.repeat(157) + '...';
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: body });
+
+  assert.equal(err, undefined);
+  const calls = readCalls(dir);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].data.body, expected);
+  assert.equal(expected.length, 160, 'the result sits exactly on the 160-septet budget');
+  assert.equal(
+    Buffer.compare(Buffer.from(calls[0].data.body, 'utf8'), Buffer.from(expected, 'utf8')),
+    0,
+    `sent body bytes differ: ${JSON.stringify(calls[0].data.body)}`
+  );
+  await waitFor(() => readLogLines(dir).length === 2);
+  assert.deepEqual(logLines(dir).sort(), [
+    'alert=a-1 outcome=body_truncated trigger="€" dropped=2',
+    'alert=a-1 to=1/1 outcome=ok ref=REF-1'
+  ].sort());
+});
+
+test('charset: GSM extension characters in the kept prefix count two septets each towards the budget', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+  const loggerBin = writeFakeLogger(dir);
+  // The prefix is 158 septets (156 single-septet b's plus the '[' at two),
+  // so 158 + 3 dots is over budget: dropping the 2-septet '[' is enough, and
+  // miscounting '[' as one septet would keep it and end at 161.
+  const body = 'b'.repeat(156) + '[' + '€';
+  const expected = 'b'.repeat(156) + '...';
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin, loggerBin: loggerBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: body });
+
+  assert.equal(err, undefined);
+  const calls = readCalls(dir);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].data.body, expected);
+  // 156 b's (156 septets) + 3 dots: 159 septets, within budget.
+  assert.equal(expected.length, 159);
+  await waitFor(() => readLogLines(dir).length === 2);
+  assert.deepEqual(logLines(dir).sort(), [
+    'alert=a-1 outcome=body_truncated trigger="€" dropped=2',
     'alert=a-1 to=1/1 outcome=ok ref=REF-1'
   ].sort());
 });
