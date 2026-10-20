@@ -34,8 +34,11 @@
   <p><b>Output 2 — failed:</b> <code>{ ok: false, code, message }</code>
   (e.g. <code>invalid_payload</code>, <code>queue_timeout</code>,
   <code>recipients_unavailable</code>, <code>no_recipients</code>,
-  <code>busy</code>, <code>ubus_timeout</code>, <code>ubus_unavailable</code>,
-  <code>ubus_error</code>, or the rpcd error code).</p>
+  <code>channel_mismatch</code>, <code>busy</code>, <code>ubus_timeout</code>,
+  <code>ubus_unavailable</code>, <code>ubus_error</code>, or the rpcd error code).
+  <code>channel_mismatch</code> means <code>alertId</code>'s entry in the
+  recipients file is not for the <code>sms</code> channel;
+  the node refuses rather than fall back to another transport.</p>
   <p>Sends are serialised process-wide: one alert fan-out holds the send slot
   at a time and the others queue. If the slot does not free within
   <code>queueWaitMs</code> (node config, or the

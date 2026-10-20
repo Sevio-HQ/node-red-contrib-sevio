@@ -617,6 +617,247 @@ test('empty recipient list fails with no_recipients', async (t) => {
   assert.equal(failure.payload.code, 'no_recipients');
 });
 
+// ---------------------------------------------------------------------------
+// Recipients artefact: the compatibility contract (§3.3)
+//
+// The artefact is channel-keyed — `{ <alertId>: { channel, targets } }`. The
+// legacy shape `{ <alertId>: [mobiles] }` is accepted as `channel: "sms"` so a
+// new node keeps working against an older gateway; the readers ship before the
+// artefact changes shape. Another, unknown or missing channel fails closed with
+// `channel_mismatch` — never a silent skip and never a fallback to another
+// transport. `channel_mismatch` means only "this entry is not my channel", so a
+// missing or unusable targets list on the sms channel is `no_recipients`.
+// ---------------------------------------------------------------------------
+
+function assertChannelMismatch(node, dir) {
+  assert.equal(node.sent.length, 1, 'the input produced exactly one output pair');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null, 'a channel mismatch never reports success');
+  assert.equal(failure.payload.ok, false);
+  assert.equal(failure.payload.code, 'channel_mismatch');
+  assert.equal(typeof failure.payload.message, 'string');
+  assert.equal(node.errors.length, 1);
+  assert.equal(node.statusCalls[node.statusCalls.length - 1].fill, 'red');
+  assert.equal(readCalls(dir).length, 0, 'a channel mismatch must never reach the transport');
+}
+
+function assertNoRecipients(node, dir) {
+  assert.equal(node.sent.length, 1, 'the input produced exactly one output pair');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.ok, false);
+  assert.equal(failure.payload.code, 'no_recipients');
+  assert.equal(node.errors.length, 1);
+  assert.equal(node.statusCalls[node.statusCalls.length - 1].fill, 'red');
+  assert.equal(readCalls(dir).length, 0, 'no recipients must never reach the transport');
+}
+
+test('artefact: a legacy bare array is accepted as the sms channel', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipients = ['+390000000001', '+390000000002'];
+  const recipientsFile = writeRecipients(dir, { 'a-1': recipients });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: true, ref: 'ref-1' } },
+    { exit: 0, stdout: { ok: true, ref: 'ref-2' } }
+  ]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assert.deepEqual(readCalls(dir).map((call) => call.data), recipients.map((number) => ({
+    to: [number],
+    body: 'hello'
+  })));
+  const [success, failure] = node.sent[0];
+  assert.equal(failure, null);
+  assert.deepEqual(success.payload, { ok: true, ref: 'ref-1,ref-2' });
+});
+
+test('artefact: an object with channel "sms" fans out its targets', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipients = ['+390000000001', '+390000000002'];
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'sms', targets: recipients }
+  });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: true, ref: 'ref-1' } },
+    { exit: 0, stdout: { ok: true, ref: 'ref-2' } }
+  ]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assert.deepEqual(readCalls(dir).map((call) => call.data), recipients.map((number) => ({
+    to: [number],
+    body: 'hello'
+  })));
+  const [success, failure] = node.sent[0];
+  assert.equal(failure, null);
+  assert.deepEqual(success.payload, { ok: true, ref: 'ref-1,ref-2' });
+});
+
+test('artefact: an email entry fails closed with channel_mismatch and is never sent', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['ops@example.com'] }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertChannelMismatch(node, dir);
+  // The address that must not be dialled is not echoed into the failure either.
+  assert.equal(node.sent[0][1].payload.message.includes('ops@example.com'), false);
+});
+
+test('artefact: an unknown channel fails closed with channel_mismatch', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'webhook', targets: ['+390000000001'] }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertChannelMismatch(node, dir);
+});
+
+test('artefact: an entry with no channel fails closed with channel_mismatch', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { targets: ['+390000000001'] }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertChannelMismatch(node, dir);
+});
+
+test('artefact: a non-object entry fails closed with channel_mismatch', async (t) => {
+  const cases = [
+    { name: 'a string entry', entry: '+390000000001' },
+    { name: 'a number entry', entry: 7 }
+  ];
+  for (const testCase of cases) {
+    const dir = tempDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const recipientsFile = writeRecipients(dir, { 'a-1': testCase.entry });
+    const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+    const node = createNodeFactory()({ name: testCase.name, recipientsFile: recipientsFile, ubusBin: ubusBin });
+    const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+    assert.equal(err, undefined);
+    assertChannelMismatch(node, dir);
+  }
+});
+
+test('artefact: a missing targets key on the sms channel fails with no_recipients', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': { channel: 'sms' } });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertNoRecipients(node, dir);
+  // Not a channel problem: the message names the actual problem.
+  assert.equal(node.sent[0][1].payload.message, 'alert a-1 has no usable targets list');
+});
+
+test('artefact: targets that are not an array on the sms channel fail with no_recipients', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'sms', targets: '+390000000001' }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertNoRecipients(node, dir);
+  assert.equal(node.sent[0][1].payload.message, 'alert a-1 has no usable targets list');
+});
+
+test('artefact: an empty sms target list still fails with no_recipients', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': { channel: 'sms', targets: [] } });
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile });
+  await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assertNoRecipients(node, dir);
+  assert.equal(node.sent[0][1].payload.message, 'alert a-1 has no usable targets list');
+});
+
+test('artefact: a missing entry keeps no_recipients even when other channels are present', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-2': { channel: 'email', targets: ['ops@example.com'] }
+  });
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile });
+  await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.code, 'no_recipients');
+});
+
+test('artefact: an email entry for another alert does not disturb an sms send', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'email-alert': { channel: 'email', targets: ['ops@example.com'] },
+    'a-1': { channel: 'sms', targets: ['+390000000001'] }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  const calls = readCalls(dir);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].data, { to: ['+390000000001'], body: 'hello' });
+  assert.deepEqual(node.sent[0][0].payload, { ok: true, ref: 'REF-1' });
+});
+
+test('artefact: a channel mismatch calls done() exactly once', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['ops@example.com'] }
+  });
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile });
+  const result = await sendInputCounting(node, { alertId: 'a-1', body: 'hello' }).promise;
+  await delay(50);
+
+  assert.equal(result.doneCalls, 1);
+  assert.equal(node.sent[0][1].payload.code, 'channel_mismatch');
+});
+
 test('successful send logs one line with the outcome and ref', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

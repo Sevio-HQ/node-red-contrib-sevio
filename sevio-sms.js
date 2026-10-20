@@ -148,10 +148,30 @@ module.exports = (RED) => {
     }
   };
 
+  const SMS_CHANNEL = 'sms';
+
+  // Names the channel of a rejected entry for the error message without ever
+  // rendering a non-string as `[object Object]` or `undefined`.
+  const channelName = (channel) => (
+    typeof channel === 'string' && channel !== '' ? JSON.stringify(channel) : 'missing'
+  );
+
   /**
    * Resolves recipient numbers for an alert from the datagateway-written file.
    * The resolved numbers are only ever passed to the ubus call — never logged,
    * never included in status or error messages.
+   *
+   * The artefact is channel-keyed: `{ <alertId>: { channel, targets } }`. The
+   * earlier shape, `{ <alertId>: [mobiles] }`, is still accepted and means
+   * `channel: "sms"`: the readers ship before the artefact changes shape, so a
+   * new node must keep working against an older gateway. Everything that is
+   * not this node's channel — a missing channel, another channel (`email`), an
+   * unknown channel or an entry of the wrong shape — fails closed with
+   * `channel_mismatch`. Never a silent skip and never a fallback to another
+   * transport: hiding the mismatch would turn an activation mistake into a
+   * delivery nobody can explain. `channel_mismatch` means exactly that and
+   * nothing else, so a missing or unusable `targets` list on the sms channel
+   * is `no_recipients`: a targets problem, not a channel problem.
    */
   const readRecipients = (file, alertId, callback) => {
     fs.readFile(file, 'utf8', (err, data) => {
@@ -170,12 +190,41 @@ module.exports = (RED) => {
         callback(failure('recipients_unavailable', `invalid recipients file content: ${file}`));
         return;
       }
-      const to = map[alertId];
-      if (!Array.isArray(to) || to.length === 0) {
+      const entry = map[alertId];
+      if (entry === undefined || entry === null) {
         callback(failure('no_recipients', `no recipients for alert ${alertId}`));
         return;
       }
-      callback(null, to);
+      // Legacy artefact: a bare array is the sms channel.
+      if (Array.isArray(entry)) {
+        if (entry.length === 0) {
+          callback(failure('no_recipients', `no recipients for alert ${alertId}`));
+          return;
+        }
+        callback(null, entry);
+        return;
+      }
+      if (typeof entry !== 'object') {
+        callback(failure(
+          'channel_mismatch',
+          `invalid recipient entry for alert ${alertId}: expected an array or a { channel, targets } object`
+        ));
+        return;
+      }
+      if (entry.channel !== SMS_CHANNEL) {
+        callback(failure(
+          'channel_mismatch',
+          `alert ${alertId} recipients are for channel ${channelName(entry.channel)}, not ${SMS_CHANNEL}`
+        ));
+        return;
+      }
+      // `channel_mismatch` means exactly one thing — this entry is not my
+      // channel — so a list problem on the sms channel is `no_recipients`.
+      if (!Array.isArray(entry.targets) || entry.targets.length === 0) {
+        callback(failure('no_recipients', `alert ${alertId} has no usable targets list`));
+        return;
+      }
+      callback(null, entry.targets);
     });
   };
 
