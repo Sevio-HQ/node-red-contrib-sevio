@@ -1,0 +1,61 @@
+<script type="text/javascript">
+  RED.nodes.registerType('sevio-email', {
+    category: 'Sevio',
+    color: '#a6bbcf',
+    defaults: {
+      name: { value: '' },
+      // Per-flow values, written by the datagateway builder: the rendered
+      // 0600 msmtprc path and the From mailbox. Declared here so a redeploy
+      // round trip keeps them; the binary is never part of a message.
+      msmtpConfig: { value: '' },
+      from: { value: '' }
+    },
+    inputs: 1,
+    outputs: 2,
+    icon: 'envelope-o.png',
+    label: function() {
+      return this.name || 'sevio-email';
+    }
+  });
+</script>
+
+<script type="text/html" data-template-name="sevio-email">
+  <div class="form-row">
+    <label for="node-input-name">
+      <i class="fa fa-tag"></i>
+      Name
+    </label>
+    <input type="text" id="node-input-name" placeholder="Name">
+  </div>
+</script>
+
+<script type="text/html" data-help-name="sevio-email">
+  <p>Sends an alert email through <code>msmtp</code>, one message per recipient.</p>
+  <p>Input <code>msg.payload</code>: <code>{ alertId, subject, body }</code>. The node
+  resolves the recipient addresses for <code>alertId</code> from
+  <code>/tmp/datagateway-alert-recipients.json</code>, written by datagateway;
+  addresses are never stored in the flow and are never logged.</p>
+  <p>Each recipient gets its own <code>msmtp</code> invocation — never a CC/BCC
+  list — with the rendered config as <code>--file=…</code>, an option terminator
+  <code>--</code> and the address as the only argument. The message is composed
+  by the node and written to the child's stdin.</p>
+  <p><b>Output 1 — accepted:</b> <code>{ ok: true, accepted: n }</code>, only when
+  <b>every</b> recipient's message was accepted by the relay.</p>
+  <p><b>Output 2 — not confirmed:</b>
+  <code>{ ok: false, code, message, accepted: n, total: m }</code>
+  (e.g. <code>invalid_payload</code>, <code>queue_timeout</code>,
+  <code>recipients_unavailable</code>, <code>no_recipients</code>,
+  <code>channel_mismatch</code>, <code>too_many_recipients</code>,
+  <code>invalid_recipient</code>, <code>email_unavailable</code>,
+  <code>deferred</code>, <code>rejected</code>, <code>outcome_unknown</code>).
+  A failure means complete acceptance was not confirmed, not that nothing was
+  sent: <code>outcome_unknown</code> is reported when the message data was
+  handed to the relay but no final acceptance arrived — it is never retried,
+  because a retry could duplicate the message.</p>
+  <p>Only a connection failure or an explicit 4xx deferral is retried (twice,
+  with a 2 s backoff); a 5xx, an authentication failure or a rejected
+  recipient is permanent. Sends are serialised per node type: one email
+  fan-out holds the slot at a time and the others queue. If the slot does not
+  free within <code>queueWaitMs</code> (default 30000 ms) the input fails with
+  <code>queue_timeout</code> and no message is composed.</p>
+</script>
