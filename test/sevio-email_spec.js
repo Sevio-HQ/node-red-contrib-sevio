@@ -68,8 +68,16 @@ const count = fs.readFileSync(path.join(dir, 'calls.log'), 'utf8').trim().split(
 const scenario = JSON.parse(fs.readFileSync(path.join(dir, 'scenario.json'), 'utf8'));
 const step = scenario.steps[Math.min(count - 1, scenario.steps.length - 1)];
 
+// One line per invocation: <call>:<pid>:<startedAt>. A lingering child is
+// never reaped while the test runs, so the pid is how a test tells whether
+// two msmtp processes were ever alive at the same time.
+const recordPid = () => {
+  fs.writeFileSync(path.join(dir, 'pid'), String(process.pid));
+  fs.appendFileSync(path.join(dir, 'pids.log'), count + ':' + process.pid + ':' + Date.now() + '\\n');
+};
+
 process.on('SIGTERM', () => {
-  fs.writeFileSync(path.join(dir, 'killed'), '1');
+  try { fs.writeFileSync(path.join(dir, 'killed'), '1'); } catch (err) {}
   process.exit(143);
 });
 
@@ -82,13 +90,13 @@ const emit = () => {
 };
 
 if (step.hang) {
-  fs.writeFileSync(path.join(dir, 'pid'), String(process.pid));
+  recordPid();
   setInterval(() => {}, 1000);
 } else {
   process.stdin.on('data', (chunk) => { input += chunk; });
   process.stdin.on('end', () => {
     if (step.delayMs) {
-      fs.writeFileSync(path.join(dir, 'pid'), String(process.pid));
+      recordPid();
       setTimeout(emit, step.delayMs);
     } else {
       emit();
@@ -113,6 +121,38 @@ function readCalls(dir) {
 
 function readMessage(dir, n) {
   return fs.readFileSync(path.join(dir, 'messages', `${n}.eml`), 'utf8');
+}
+
+// Every invocation's child: { call, pid, at }, in start order.
+function readPids(dir) {
+  const file = path.join(dir, 'pids.log');
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => {
+    const [call, pid, at] = line.split(':');
+    return { call: Number(call), pid: Number(pid), at: Number(at) };
+  });
+}
+
+/**
+ * True only for a process that is still executing. A child killed with SIGKILL
+ * is dead as soon as the kernel takes it, but until Node reaps it the pid still
+ * answers `kill(pid, 0)` as a zombie — a zombie runs nothing and holds no
+ * socket, so it is not a second live msmtp. Off /proc (non-Linux) the pid's
+ * mere existence is the best available answer.
+ */
+function isLive(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    return false;
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const close = stat.lastIndexOf(')');
+    return stat.slice(close + 2, close + 3) !== 'Z';
+  } catch (err) {
+    return true;
+  }
 }
 
 function sendInput(node, payload) {
@@ -146,6 +186,16 @@ function waitFor(predicate, timeoutMs = 2000) {
     };
     tick();
   });
+}
+
+// Bounds a promise the node may never settle. A run the watchdog abandons
+// without a terminal output would otherwise hang the whole file instead of
+// failing the one test that exposed it.
+function deadline(promise, ms, message) {
+  return Promise.race([
+    promise,
+    delay(ms).then(() => { throw new Error(message); })
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +825,34 @@ test('an authentication failure is permanent and is not retried', async (t) => {
 
   await delay(60);
   assert.equal(readCalls(dir).length, 1);
-  assert.equal(node.sent[0][1].payload.code, 'rejected');
+  assert.equal(node.sent[0][1].payload.code, 'auth_failed');
+});
+
+// Regression: a relay reports a failed login as SMTP 454 ("temporary
+// authentication failure"). A 4xx is normally a deferral and is retried, but a
+// credential fault is permanent, so the recognised authentication failure must
+// be classified before the generic server-reply branches.
+test('an authentication failure carrying SMTP 454 is permanent, not a deferral', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['ops@example.com'] }
+  });
+  const msmtpBin = writeFakeMsmtp(dir, [
+    { exit: 75, stderr: 'msmtp: server message: 454 4.7.0 authentication failed\n' }
+  ]);
+
+  const node = makeNode(dir, { recipientsFile: recipientsFile, msmtpBin: msmtpBin });
+  await sendInput(node, { alertId: 'a-1', subject: 'Hi', body: 'x' });
+
+  await delay(60); // longer than the 10 ms backoff: a `deferred` retry would have fired
+  assert.equal(readCalls(dir).length, 1, 'a credential fault must be attempted exactly once');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.code, 'auth_failed');
+  assert.equal(failure.payload.accepted, 0);
+  assert.equal(failure.payload.total, 1);
+  assert.match(failure.payload.message, /refused the authentication/);
 });
 
 // A TLS handshake or certificate failure is permanent: the trust path is
@@ -883,6 +960,185 @@ test('a hung child is killed at the per-attempt deadline and reports outcome_unk
       return killErr.code === 'ESRCH';
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// The SLOT watchdog — distinct from the per-attempt deadline just above.
+// The per-attempt deadline ends one child inside a live run; the slot watchdog
+// ends the whole run so the slot can change hands. It must abort the run (kill
+// the child, cancel the backoff timers, emit one failure, stop the fan-out)
+// BEFORE the slot transfers: releasing the slot while the abandoned child is
+// still alive puts two msmtp processes on the relay at once, which is exactly
+// what the slot exists to prevent.
+// ---------------------------------------------------------------------------
+
+test('the slot watchdog kills the live child before the slot changes hands, and emits one failure', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['first@example.com', 'second@example.com', 'third@example.com'] },
+    'b-1': { channel: 'email', targets: ['behind@example.com'] }
+  });
+  // Every child lingers and never writes a reply: the abandoned run still has
+  // a live msmtp process when the slot bound expires.
+  const msmtpBin = writeFakeMsmtp(dir, [{ hang: true }]);
+  const make = createNodeFactory();
+  const baseConfig = {
+    recipientsFile: recipientsFile,
+    msmtpBin: msmtpBin,
+    msmtpConfig: path.join(dir, 'flow.msmtprc'),
+    from: 'alerts@example.com'
+  };
+  // Accelerated slot bound only: the per-attempt deadline keeps its 30 s
+  // default, so whatever happens is the slot watchdog's doing, not a child
+  // deadline.
+  const holder = make(Object.assign({ name: 'holder', slotMaxMs: 120 }, baseConfig));
+  const behind = make(Object.assign({ name: 'behind', slotMaxMs: 120 }, baseConfig));
+  // Unconditional cleanup: an assertion failure must still kill the hung
+  // children, or the runner would wait for them forever.
+  const closeAll = () => {
+    behind.emit('close', false, () => {});
+    holder.emit('close', false, () => {});
+  };
+  t.after(closeAll);
+
+  // Observation: how many children are live at each sample. The slot exists so
+  // that this number is never above one.
+  const samples = [];
+  const poller = setInterval(() => {
+    samples.push(readPids(dir).filter((record) => isLive(record.pid)).length);
+  }, 2);
+  t.after(() => clearInterval(poller));
+
+  // Observation: the moment the node kills a child, so the kill can be placed
+  // in time relative to the next child's start.
+  const kills = [];
+  const childProcess = require('node:child_process');
+  const realKill = childProcess.ChildProcess.prototype.kill;
+  childProcess.ChildProcess.prototype.kill = function (signal) {
+    kills.push({ pid: this.pid, signal: signal, at: Date.now() });
+    return realKill.apply(this, arguments);
+  };
+  t.after(() => { childProcess.ChildProcess.prototype.kill = realKill; });
+
+  holder.emit('input', { payload: { alertId: 'a-1', subject: 'Hi', body: 'x' } }, null, () => {});
+  await waitFor(() => readPids(dir).length === 1);
+  const holderChild = readPids(dir)[0];
+
+  // The second node queues behind the holder: its turn IS the slot transfer.
+  behind.emit('input', { payload: { alertId: 'b-1', subject: 'Hi', body: 'x' } }, null, () => {});
+
+  // The abort is what terminates the abandoned input: without it the run would
+  // hang on its child and this never happens.
+  await waitFor(() => holder.sent.length === 1, 3000);
+  // The queued node's turn: its child records the pid a moment after it logs
+  // the call, so wait for the pid record — that is the slot transfer.
+  await waitFor(() => readPids(dir).some((record) => record.call === 2), 3000);
+
+  // 1. Exactly one terminal output, on output 2, and the code is
+  //    outcome_unknown: the slot expired around a message that may already
+  //    have been accepted, so it is never a retry.
+  assert.equal(holder.sent.length, 1, 'exactly one output for the aborted run');
+  const [success, failed] = holder.sent[0];
+  assert.equal(success, null);
+  assert.equal(failed.payload.ok, false);
+  assert.equal(failed.payload.code, 'outcome_unknown');
+  assert.equal(failed.payload.accepted, 0);
+  assert.equal(failed.payload.total, 3);
+  assert.match(failed.payload.message, /slot expired/);
+  assert.equal(holder.errors.length, 1);
+
+  // 2. The live child is dead, and it was SIGKILLed (the fake cannot record a
+  //    SIGTERM that would have let msmtp keep running).
+  const holderKill = kills.find((kill) => kill.pid === holderChild.pid);
+  assert.ok(holderKill, 'the slot watchdog killed the abandoned run\'s child');
+  assert.equal(holderKill.signal, 'SIGKILL');
+  await waitFor(() => !isLive(holderChild.pid), 1000);
+  assert.equal(fs.existsSync(path.join(dir, 'killed')), false, 'the slot kill is SIGKILL, not SIGTERM');
+
+  // 3. The fan-out stopped: recipients 2 and 3 of the abandoned run are never
+  //    attempted. Call 2 belongs to the alert that now holds the slot.
+  const calls = readCalls(dir);
+  assert.deepEqual(calls.map((call) => call.argv[2]), ['first@example.com', 'behind@example.com']);
+
+  // 4. The kill is issued BEFORE the slot changes hands: the next child starts
+  //    only after the abandoned one was killed.
+  const behindChild = readPids(dir).find((record) => record.call === 2);
+  assert.ok(behindChild, 'the queued node takes the slot');
+  assert.ok(
+    holderKill.at <= behindChild.at,
+    `the abandoned child was killed at ${holderKill.at}, the next child started at ${behindChild.at}`
+  );
+
+  // 5. No second failure ever appears, even after the killed child's own close
+  //    callback lands.
+  await delay(120);
+  assert.equal(holder.sent.length, 1, 'the kill callback must not emit a second failure');
+  assert.equal(holder.errors.length, 1);
+
+  // 6. Never more than one live child at any moment.
+  assert.equal(
+    Math.max(0, ...samples),
+    1,
+    `two children were alive at once (${samples.filter((n) => n > 1).length} of ${samples.length} samples)`
+  );
+});
+
+test('the slot watchdog clears a pending backoff timer: the abandoned run never retries', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['first@example.com', 'second@example.com'] }
+  });
+  // A 4xx arms the backoff timer; the slot bound expires while the run is
+  // still waiting to retry, so the timer is pending at the abort.
+  const msmtpBin = writeFakeMsmtp(dir, [DEFERRED_451, ACCEPTED]);
+
+  // Observe every timer the node creates: the retry timer is the one created
+  // with the node's backoff, and the abort must have cleared it.
+  const timers = new Map();
+  const realSetTimeout = global.setTimeout;
+  const realClearTimeout = global.clearTimeout;
+  global.setTimeout = function (fn, ms) {
+    const handle = realSetTimeout.apply(this, arguments);
+    timers.set(handle, { ms: ms, cleared: false });
+    return handle;
+  };
+  global.clearTimeout = function (handle) {
+    if (timers.has(handle)) timers.get(handle).cleared = true;
+    return realClearTimeout.apply(this, arguments);
+  };
+  t.after(() => {
+    global.setTimeout = realSetTimeout;
+    global.clearTimeout = realClearTimeout;
+  });
+
+  const node = makeNode(dir, {
+    recipientsFile: recipientsFile,
+    msmtpBin: msmtpBin,
+    slotMaxMs: 100,   // expires while the retry waits
+    backoffMs: 150    // the retry would fire at ~150 ms, after the slot bound
+  });
+  // The abort is what ends this input: a watchdog that only releases the slot
+  // leaves the run abandoned with no terminal output at all.
+  await deadline(
+    sendInput(node, { alertId: 'a-1', subject: 'Hi', body: 'x' }),
+    3000,
+    'the slot watchdog never produced a terminal output for the abandoned run'
+  );
+
+  // One deferred attempt, then one failure — no retry behind the next alert.
+  await delay(300);
+  assert.equal(readCalls(dir).length, 1, 'the abandoned run never retries');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.code, 'outcome_unknown');
+  assert.equal(failure.payload.accepted, 0);
+  assert.equal(failure.payload.total, 2);
+
+  const backoffTimers = [...timers.values()].filter((timer) => timer.ms === 150);
+  assert.equal(backoffTimers.length, 1, 'the deferral armed exactly one backoff timer');
+  assert.equal(backoffTimers[0].cleared, true, 'the slot abort cleared the pending backoff timer');
 });
 
 test('fail-fast: a failure on the second recipient reports accepted 1/2 and stops', async (t) => {

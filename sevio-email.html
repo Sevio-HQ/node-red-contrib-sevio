@@ -48,16 +48,20 @@
   <code>channel_mismatch</code>, <code>too_many_recipients</code>,
   <code>invalid_recipient</code>, <code>email_unavailable</code>,
   <code>deferred</code>, <code>rejected</code>, <code>tls_failure</code>,
-  <code>outcome_unknown</code>).
+  <code>auth_failed</code>, <code>outcome_unknown</code>).
   A failure means complete acceptance was not confirmed, not that nothing was
   sent: <code>outcome_unknown</code> is reported when the message data was
   handed to the relay but no final acceptance arrived — it is never retried,
   because a retry could duplicate the message.</p>
-  <p>Only a connection failure or an explicit 4xx deferral is retried (twice,
-  with a 2 s backoff); a 5xx, an authentication failure, a rejected
-  recipient or a TLS handshake/certificate failure is permanent. Sends are
+  <p>Only a connection failure or an explicit 4xx deferral is retried: two
+  attempts per recipient in total (the first try plus <b>one</b> retry), with a
+  2 s backoff. A 5xx, an authentication failure, a rejected recipient or a TLS
+  handshake/certificate failure is permanent. Sends are
   serialised per node type: one email
   fan-out holds the slot at a time and the others queue. If the slot does not
   free within <code>queueWaitMs</code> (default 30000 ms) the input fails with
-  <code>queue_timeout</code> and no message is composed.</p>
+  <code>queue_timeout</code> and no message is composed. A fan-out that outlives
+  its whole slot bound is aborted — its <code>msmtp</code> child is killed, its
+  pending retry cancelled and no later recipient attempted — and reports
+  <code>outcome_unknown</code>, never a retry.</p>
 </script>

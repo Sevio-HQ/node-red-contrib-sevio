@@ -29,6 +29,9 @@
 // datagateway's copy; the test asserts the derivation, and a drift on either
 // side is a test failure on that side.
 const PER_ATTEMPT_DEADLINE_MS = 30000; // end-to-end, including connect
+// ATTEMPTS counts attempts, first try included — it is NOT a retry count. 2
+// means one attempt plus exactly **one** retry; the guard is
+// `attempt < ATTEMPTS`, and (ATTEMPTS - 1) below is the number of retries.
 const ATTEMPTS = 2;
 const BACKOFF_MS = 2000;
 const FANOUT_CAP = 5;
@@ -323,7 +326,12 @@ module.exports = (RED) => {
    *
    * - an explicit 5xx is a permanent rejection; an explicit 4xx is a deferral
    *   and is retried (SMTP says a 4xx is not an acceptance);
-   * - an authentication or configuration failure is permanent;
+   * - a recognised authentication failure is permanent and is classified
+   *   before the server reply, because a relay reports it as 454 or 535: left
+   *   to the generic branches, the 454 reading would retry a credential fault
+   *   as `deferred`. It gets its own code (`auth_failed`), on the same
+   *   reasoning as `tls_failure` below: `rejected` would claim the relay
+   *   refused the message, when in fact the session never got that far;
    * - a TLS handshake or certificate failure is permanent, not a deferral:
    *   the trust path is deterministic, so a certificate that fails
    *   verification will fail again two seconds later. It is checked before
@@ -343,10 +351,16 @@ module.exports = (RED) => {
       return { code: 'email_unavailable', retry: false };
     }
     const stderr = exit.stderr || '';
+    // A recognised authentication failure is permanent and is decided BEFORE
+    // the server-reply branches: a relay that reports a failed login as SMTP
+    // 454 ("temporary authentication failure") would otherwise fall into the
+    // generic 4xx branch and be retried as `deferred`. Retrying cannot fix
+    // credentials, and `deferred` would claim the relay postponed the message
+    // when in fact it refused the session.
+    if (AUTH_FAILURE.test(stderr)) return { code: 'auth_failed', retry: false };
     const reply = lastServerReply(stderr);
     if (reply !== null && reply >= 500) return { code: 'rejected', retry: false };
     if (reply !== null && reply >= 400) return { code: 'deferred', retry: true };
-    if (AUTH_FAILURE.test(stderr)) return { code: 'rejected', retry: false };
     // A bad certificate or a failed handshake will not improve on a retry, and
     // `rejected` would claim the relay refused the message when in fact the
     // trust path never got that far: a distinct code names the real fault.
@@ -377,6 +391,9 @@ module.exports = (RED) => {
     }
     if (code === 'tls_failure') {
       return `${head} was not sent: the TLS connection to the relay could not be established`;
+    }
+    if (code === 'auth_failed') {
+      return `${head} was not sent: the relay refused the authentication`;
     }
     return `${head} was rejected by the relay`;
   };
@@ -463,6 +480,12 @@ module.exports = (RED) => {
   // claims a cross-channel bound. Inside a flow, overlap cannot arise in the
   // first place because the run is single-flight; the queue exists for
   // process-wide safety, not to enable concurrency.
+  //
+  // The slot bound is a hard stop, not merely an accounting deadline: when it
+  // expires the owning run is still alive, so the watchdog ABORTS it (kills the
+  // live child, cancels its backoff timers, emits one failure) and only then
+  // releases the slot. Releasing first would put two msmtp processes on the
+  // relay at once, which is exactly what the slot exists to prevent.
   // ---------------------------------------------------------------------------
   const waiters = [];
   let held = false;
@@ -473,7 +496,17 @@ module.exports = (RED) => {
     clearTimeout(waiter.timer); // queue wait bounds waiting only, never the send
     held = true;
     let released = false;
-    const watchdog = setTimeout(release, waiter.slotMaxMs);
+    const watchdog = setTimeout(() => {
+      // A terminal path already released the slot and cleared this timer.
+      if (released) return;
+      try {
+        // Abort BEFORE the transfer, and even if the abort throws: the slot
+        // must never stay held because cleanup failed.
+        if (waiter.onSlotExpired) waiter.onSlotExpired();
+      } finally {
+        release();
+      }
+    }, waiter.slotMaxMs);
     // Idempotent: success, every failure, every closed early-return and the
     // watchdog can all call it; only the first call frees the slot.
     function release() {
@@ -490,9 +523,19 @@ module.exports = (RED) => {
    * Queues `start(release, isReleased)` for the next free slot. `owner` is the
    * node instance: its close sweeps out not-yet-started waiters by identity,
    * so a closed node can never start a send.
+   *
+   * `onSlotExpired` is the run's abort hook. It runs synchronously when the
+   * slot watchdog fires, while the run still holds the slot: it must kill what
+   * the run has live, emit its one terminal output and return. The slot is
+   * released after it returns, never before.
    */
-  const acquire = (owner, waitMs, start, onTimeout, slotMaxMs) => {
-    const waiter = { owner: owner, start: start, slotMaxMs: slotMaxMs || SLOT_MAX_MS };
+  const acquire = (owner, waitMs, start, onTimeout, slotMaxMs, onSlotExpired) => {
+    const waiter = {
+      owner: owner,
+      start: start,
+      slotMaxMs: slotMaxMs || SLOT_MAX_MS,
+      onSlotExpired: onSlotExpired
+    };
     waiter.timer = setTimeout(() => {
       const i = waiters.indexOf(waiter);
       // Already started or swept by close (both clear the timer first).
@@ -556,15 +599,29 @@ module.exports = (RED) => {
       // failure and the closed early-returns — so a failed or aborted send can
       // never wedge the queue. `slotReleased()` is true once the slot watchdog
       // has freed the slot under this input.
+
+      // --- this run's own state -------------------------------------------
+      // A run owns its live children and its backoff timers, so the slot
+      // watchdog can abort exactly this run: `children`/`retryTimers` above are
+      // the node-wide registries `close` sweeps, and every entry lives in both.
+      // `runDone` makes the terminal output structurally single: whichever path
+      // arrives second (the abort's kill callback, a late child close) is a
+      // no-op instead of a second failure on output 2.
+      const runChildren = new Set();
+      const runTimers = new Set();
+      let runDone = false;     // a terminal output already happened
+      let runAborted = false;  // the slot watchdog took this run away
+      let runIndex = 0;        // recipient in flight, for the failure message
+      let runAttempt = 1;      // attempt in flight, for the log line
+      let runTotal = 0;        // recipients this run knows about
+      let runAccepted = 0;     // recipients the relay confirmed
+
       let release = null;
       let slotReleased = null;
 
-      // The outgoing message keeps the whole incoming msg, so `alertCtx`
-      // (and with it `alertCtx.runId`) survives the send and the flow's run
-      // tag still correlates — the same way `sevio-sms` preserves it.
-      const fail = (code, message, accepted, total) => {
-        if (release) release();
-        if (closed) return;
+      const emitFailure = (code, message, accepted, total) => {
+        if (closed || runDone) return;
+        runDone = true;
         node.status({ fill: 'red', shape: 'dot', text: code });
         node.error(message, msg);
         send([null, Object.assign({}, msg, {
@@ -579,9 +636,18 @@ module.exports = (RED) => {
         done();
       };
 
+      // The outgoing message keeps the whole incoming msg, so `alertCtx`
+      // (and with it `alertCtx.runId`) survives the send and the flow's run
+      // tag still correlates — the same way `sevio-sms` preserves it.
+      const fail = (code, message, accepted, total) => {
+        if (release) release();
+        emitFailure(code, message, accepted, total);
+      };
+
       const succeed = (accepted) => {
         if (release) release();
-        if (closed) return;
+        if (closed || runDone) return;
+        runDone = true;
         node.status({ fill: 'green', shape: 'dot', text: 'accepted' });
         send([Object.assign({}, msg, { payload: { ok: true, accepted: accepted } }), null]);
         done();
@@ -591,6 +657,50 @@ module.exports = (RED) => {
       // done(): Node-RED has already closed the node and drops both.
       const drop = () => {
         if (release) release();
+      };
+
+      const slotTimeoutMessage = () => {
+        const inFlight = runTotal > 0 ? ` with recipient ${runIndex + 1}/${runTotal} in flight` : '';
+        return `the email send slot expired after ${slotMaxMs}ms${inFlight}: ` +
+          'the relay did not confirm acceptance, and a retry could duplicate the message';
+      };
+
+      /**
+       * The slot watchdog's abort hook: called while this run still owns the
+       * slot, before the slot changes hands. Everything the abandoned run
+       * could still do is stopped here, in order:
+       *
+       * 1. the pending backoff timers are cancelled, so no retry re-enters the
+       *    transport behind the next alert's back;
+       * 2. every live child is SIGKILLed — the same reason as the per-attempt
+       *    deadline: a wedged msmtp must not survive and overlap the run that
+       *    now holds the slot;
+       * 3. the fan-out stops (`runAborted` makes `sendNext` and every late
+       *    child callback a no-op), so no later recipient is attempted;
+       * 4. exactly one terminal output is emitted, on output 2.
+       *
+       * The code is `outcome_unknown`, never a retry: the slot expired around a
+       * message that may already have been accepted, and a retry could send it
+       * twice. It does not release the slot; `pump` does that once this returns.
+       */
+      const abortRun = () => {
+        if (closed || runDone) return;
+        runAborted = true;
+        for (const entry of runTimers) {
+          clearTimeout(entry.timer);
+          retryTimers.delete(entry);
+        }
+        runTimers.clear();
+        const wasInFlight = runChildren.size > 0;
+        for (const child of runChildren) {
+          children.delete(child);
+          child.kill('SIGKILL');
+        }
+        runChildren.clear();
+        if (wasInFlight) {
+          logSend(loggerBin, loggerTag, alertId, runIndex, runTotal, runAttempt, 'outcome_unknown');
+        }
+        emitFailure('outcome_unknown', slotTimeoutMessage(), runAccepted, runTotal);
       };
 
       const payload = msg.payload;
@@ -640,6 +750,7 @@ module.exports = (RED) => {
             drop();
             return;
           }
+          if (runAborted || runDone) return;
           if (slotReleased && slotReleased()) {
             return;
           }
@@ -659,12 +770,16 @@ module.exports = (RED) => {
             );
             return;
           }
+          runTotal = to.length;
 
           // One msmtp invocation per recipient, sequentially, fail-fast.
           // Never a CC/BCC list: each recipient gets its own envelope, so one
           // refusal cannot be reported as a whole-list failure and one
           // acceptance cannot be inferred from another's.
           const sendNext = (index, attempt) => {
+            // The run is over: the slot watchdog aborted it, or it already
+            // produced its terminal output. No later recipient is attempted.
+            if (runAborted || runDone) return;
             if (closed) {
               drop();
               return;
@@ -678,17 +793,26 @@ module.exports = (RED) => {
               succeed(to.length);
               return;
             }
+            runIndex = index;
+            runAttempt = attempt;
 
             // `child` may still be null when the callback runs synchronously
             // (a rejected address, or a spawn that throws): both paths return
             // no child, so there is nothing to register or remove.
             let child = null;
             child = invokeMsmtp(msmtpBin, msmtpConfig, fromAddress, to[index], subject, body, perAttemptDeadlineMs, (result) => {
-              if (child) children.delete(child);
+              if (child) {
+                children.delete(child);
+                runChildren.delete(child);
+              }
               if (closed) {
                 drop();
                 return;
               }
+              // The slot watchdog aborted this run: the callback of its own
+              // killed child must not add a second output nor resume the
+              // fan-out.
+              if (runAborted || runDone) return;
               if (slotReleased && slotReleased()) {
                 return;
               }
@@ -699,7 +823,7 @@ module.exports = (RED) => {
                 fail(
                   'invalid_recipient',
                   `recipient ${index + 1}/${to.length} ${result.invalidAddress}`,
-                  index,
+                  runAccepted,
                   to.length
                 );
                 return;
@@ -709,6 +833,7 @@ module.exports = (RED) => {
               if (result.spawnCode === null && result.exitCode === 0) {
                 // Accepted by the relay: the final 250 arrived and msmtp
                 // exited cleanly.
+                runAccepted += 1;
                 logSend(loggerBin, loggerTag, alertId, index, to.length, attempt, 'ok');
                 sendNext(index + 1, 1);
                 return;
@@ -719,21 +844,31 @@ module.exports = (RED) => {
                 const entry = { timer: null, drop: drop };
                 entry.timer = setTimeout(() => {
                   retryTimers.delete(entry);
+                  runTimers.delete(entry);
                   sendNext(index, attempt + 1);
                 }, backoffMs);
                 retryTimers.add(entry);
+                runTimers.add(entry);
                 return;
               }
-              fail(outcome.code, describeFailure(outcome.code, index, to.length, attempt), index, to.length);
+              fail(
+                outcome.code,
+                describeFailure(outcome.code, index, to.length, attempt),
+                runAccepted,
+                to.length
+              );
             });
-            if (child) children.add(child);
+            if (child) {
+              children.add(child);
+              runChildren.add(child);
+            }
           };
 
           sendNext(0, 1);
         });
       }, () => {
         fail('queue_timeout', `email queue wait exceeded ${queueWaitMs}ms`);
-      }, slotMaxMs);
+      }, slotMaxMs, abortRun);
     });
 
     node.on('close', function (removed, done) {
