@@ -324,8 +324,13 @@ module.exports = (RED) => {
    * - an explicit 5xx is a permanent rejection; an explicit 4xx is a deferral
    *   and is retried (SMTP says a 4xx is not an acceptance);
    * - an authentication or configuration failure is permanent;
-   * - a connection failure (`cannot connect to …`) or a TLS handshake failure
-   *   happens before the message can be accepted, so it is retryable;
+   * - a TLS handshake or certificate failure is permanent, not a deferral:
+   *   the trust path is deterministic, so a certificate that fails
+   *   verification will fail again two seconds later. It is checked before
+   *   the generic connection text, because msmtp can report an SSL/TLS
+   *   failure with the `cannot connect` prefix;
+   * - a connection failure (`cannot connect to …`) happens before the message
+   *   can be accepted, so it is retryable;
    * - a child killed at the deadline, or one that exited before the whole
    *   message was written to its stdin, cannot have sent the terminating dot:
    *   the message was truncated, so it was definitively not accepted and the
@@ -342,11 +347,14 @@ module.exports = (RED) => {
     if (reply !== null && reply >= 500) return { code: 'rejected', retry: false };
     if (reply !== null && reply >= 400) return { code: 'deferred', retry: true };
     if (AUTH_FAILURE.test(stderr)) return { code: 'rejected', retry: false };
+    // A bad certificate or a failed handshake will not improve on a retry, and
+    // `rejected` would claim the relay refused the message when in fact the
+    // trust path never got that far: a distinct code names the real fault.
+    if (TLS_FAILURE.test(stderr)) return { code: 'tls_failure', retry: false };
     if (exit.exitCode === 77 || exit.exitCode === 78 || exit.exitCode === 64 || exit.exitCode === 66) {
       return { code: 'rejected', retry: false };
     }
     if (CONNECT_FAILURE.test(stderr)) return { code: 'deferred', retry: true };
-    if (TLS_FAILURE.test(stderr)) return { code: 'deferred', retry: true };
     if (exit.deadlineHit) {
       return exit.stdinFinished
         ? { code: 'outcome_unknown', retry: false }
@@ -366,6 +374,9 @@ module.exports = (RED) => {
     }
     if (code === 'email_unavailable') {
       return `${head} was not sent: msmtp is not available`;
+    }
+    if (code === 'tls_failure') {
+      return `${head} was not sent: the TLS connection to the relay could not be established`;
     }
     return `${head} was rejected by the relay`;
   };

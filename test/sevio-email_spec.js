@@ -778,6 +778,55 @@ test('an authentication failure is permanent and is not retried', async (t) => {
   assert.equal(node.sent[0][1].payload.code, 'rejected');
 });
 
+// A TLS handshake or certificate failure is permanent: the trust path is
+// deterministic, so a second attempt two seconds later cannot succeed, and
+// `rejected` would misreport a certificate fault as a relay refusal.
+test('a TLS certificate failure is permanent and is not retried', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['ops@example.com'] }
+  });
+  const msmtpBin = writeFakeMsmtp(dir, [
+    { exit: 75, stderr: 'msmtp: TLS certificate verification failed: certificate is not trusted\n' }
+  ]);
+
+  const node = makeNode(dir, { recipientsFile: recipientsFile, msmtpBin: msmtpBin });
+  await sendInput(node, { alertId: 'a-1', subject: 'Hi', body: 'x' });
+
+  await delay(60); // longer than the 10 ms backoff: a retry would have fired
+  assert.equal(readCalls(dir).length, 1, 'a certificate failure must be attempted exactly once');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.code, 'tls_failure');
+  assert.equal(failure.payload.accepted, 0);
+  assert.equal(failure.payload.total, 1);
+  assert.match(failure.payload.message, /TLS/);
+});
+
+test('a TLS handshake failure is permanent and is not retried', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['ops@example.com'] }
+  });
+  // msmtp can report a TLS failure with the `cannot connect` prefix: the TLS
+  // classification must win over the generic connection one.
+  const msmtpBin = writeFakeMsmtp(dir, [
+    {
+      exit: 75,
+      stderr: 'msmtp: cannot connect to smtp.example.com, port 465: A TLS packet with unexpected length was received.\n'
+    }
+  ]);
+
+  const node = makeNode(dir, { recipientsFile: recipientsFile, msmtpBin: msmtpBin });
+  await sendInput(node, { alertId: 'a-1', subject: 'Hi', body: 'x' });
+
+  await delay(60);
+  assert.equal(readCalls(dir).length, 1, 'a handshake failure must be attempted exactly once');
+  assert.equal(node.sent[0][1].payload.code, 'tls_failure');
+});
+
 test('a missing msmtp binary fails with email_unavailable', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
