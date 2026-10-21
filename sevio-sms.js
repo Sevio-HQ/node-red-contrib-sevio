@@ -452,7 +452,7 @@ module.exports = (RED) => {
       let runAborted = false;  // the slot watchdog took this run away
       let runIndex = 0;        // recipient in flight, for the failure message
       let runTotal = 0;        // recipients this run knows about
-      let runAccepted = 0;     // recipients rpcd confirmed
+      let runAccepted = 0;     // recipients rpcd confirmed, ref or no ref
 
       let release = null;
       let slotReleased = null;
@@ -643,12 +643,16 @@ module.exports = (RED) => {
 
               const reply = result && typeof result === 'object' ? result : {};
               if (reply.ok) {
+                // Acceptance is counted per resolved success, never derived
+                // from `refs`: rpcd answers `{ ok: true }` without a reference
+                // on some paths, and such a send is still accepted by the
+                // modem. `refs` only feeds the success payload's `ref`.
+                runAccepted += 1;
                 let ref = null;
                 if (reply.ref !== undefined && reply.ref !== null) {
                   ref = reply.ref;
                   refs.push(reply.ref);
                 }
-                runAccepted = refs.length;
                 logSend(loggerBin, loggerTag, alertId, index, to.length, 'ok', null, ref);
                 sendNext(index + 1, 0);
                 return;

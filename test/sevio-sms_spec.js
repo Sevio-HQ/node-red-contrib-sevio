@@ -1825,6 +1825,49 @@ test('queue: the slot watchdog SIGKILLs the live ubus child before the slot chan
   );
 });
 
+test('queue: the slot watchdog counts an accepted recipient that carried no ref', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001', '+390000000002'] });
+  // Recipient 1 is accepted by rpcd but its reply carries NO `ref` — an answer
+  // shape the modem really returns. Recipient 2 wedges, so the slot expires
+  // around it. Acceptance is a property of the resolved success, not of an
+  // optional reference: the run must report one accepted recipient, not zero.
+  const ubusBin = writeFakeUbus(dir, [
+    { delayMs: 30, stdout: { ok: true } },
+    { hang: true }
+  ]);
+
+  const node = createNodeFactory()({
+    name: 'no-ref',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    slotMaxMs: 400 // long enough for recipient 1, far shorter than recipient 2 hangs
+  });
+  // Unconditional cleanup: an assertion failure must still kill the hung child.
+  t.after(() => node.emit('close', false, () => {}));
+
+  // The abort is what ends this input: a watchdog that only releases the slot
+  // leaves the run abandoned with no terminal output at all.
+  await sendInput(node, { alertId: 'a-1', body: 'no-ref' });
+
+  // Recipient 1 was attempted and accepted before recipient 2 wedged; if the
+  // run had aborted earlier there would be no second call at all.
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), [
+    '+390000000001', '+390000000002'
+  ]);
+
+  // Exactly one terminal output, on output 2: the ref-less success is never an
+  // error, and the abort never adds a second output.
+  assert.equal(node.sent.length, 1, 'the abandoned run emits exactly one failure');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.ok, false);
+  assert.equal(failure.payload.code, 'outcome_unknown');
+  assert.equal(failure.payload.accepted, 1, 'the ref-less success is counted as accepted');
+  assert.equal(failure.payload.total, 2);
+});
+
 test('queue: the slot watchdog clears a pending busy-retry timer: the abandoned run never retries', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
