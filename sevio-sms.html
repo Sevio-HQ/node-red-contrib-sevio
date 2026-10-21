@@ -45,4 +45,12 @@
   <code>SEVIO_SMS_QUEUE_WAIT_MS</code> environment variable; default
   30000 ms) the input fails with <code>queue_timeout</code> and no
   <code>ubus</code> call is made. Invalid values fall back to the default.</p>
+  <p>If a started fan-out outlives its slot bound
+  (<code>slotMaxMs</code>, or <code>SEVIO_SMS_SLOT_MAX_MS</code>; default
+  240000 ms) the run is aborted before the slot changes hands: the in-flight
+  <code>ubus</code> call is killed, pending retries are cancelled, no later
+  recipient is attempted, and the input fails once with
+  <code>outcome_unknown</code> plus <code>accepted</code> and
+  <code>total</code> — the modem may already have accepted the message, so do
+  not retry it on that code.</p>
 </script>
