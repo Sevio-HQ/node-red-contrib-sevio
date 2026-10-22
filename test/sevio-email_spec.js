@@ -317,7 +317,7 @@ test('a subject carrying CR/LF is refused before any send', async () => {
 // Recipients artefact: the email reader's side of §3.3
 // ---------------------------------------------------------------------------
 
-test('artefact: a legacy bare array is the sms channel and fails with channel_mismatch', async (t) => {
+test('artefact: a bare array is not a shape and fails with channel_mismatch', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const recipientsFile = writeRecipients(dir, { 'a-1': ['ops@example.com'] });
@@ -329,7 +329,7 @@ test('artefact: a legacy bare array is the sms channel and fails with channel_mi
   const [success, failure] = node.sent[0];
   assert.equal(success, null);
   assert.equal(failure.payload.code, 'channel_mismatch');
-  assert.match(failure.payload.message, /legacy array/);
+  assert.match(failure.payload.message, /expected a \{ channel, targets \} object/);
   assert.equal(failure.payload.accepted, 0);
   assert.equal(failure.payload.total, 0);
   // The address that must not be mailed is not echoed into the failure either.

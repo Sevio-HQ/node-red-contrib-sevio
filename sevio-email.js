@@ -111,14 +111,14 @@ module.exports = (RED) => {
    * file. Addresses are only ever passed to the transport — never logged,
    * never included in status or error messages.
    *
-   * The artefact is channel-keyed: `{ <alertId>: { channel, targets } }`.
-   * Email **rejects** the legacy bare array (it means `channel: "sms"`) and
-   * requires `channel: "email"`: a missing, unknown or different channel, a
-   * non-object entry or the legacy array all fail closed with
-   * `channel_mismatch` — never a silent skip and never a fallback to the
-   * other transport. A missing or unusable `targets` list on the email
-   * channel is `no_recipients`: a targets problem, not a channel problem, so
-   * the code must not lie in the logs (spec §3.3).
+   * The artefact has exactly one shape: `{ <alertId>: { channel, targets } }`.
+   * Email requires `channel: "email"`: a missing, unknown or different channel,
+   * a non-object entry or a bare array all fail closed with
+   * `channel_mismatch` — never a silent skip and never a fallback to the other
+   * transport. There is no legacy shape to accept: the feature is unreleased. A
+   * missing or unusable `targets` list on the email channel is `no_recipients`:
+   * a targets problem, not a channel problem, so the code must not lie in the
+   * logs (spec §3.3).
    */
   const readRecipients = (file, alertId, callback) => {
     fs.readFile(file, 'utf8', (err, data) => {
@@ -142,15 +142,9 @@ module.exports = (RED) => {
         callback(failure('no_recipients', `no recipients for alert ${alertId}`));
         return;
       }
-      // The legacy bare array is the sms channel: email refuses it.
-      if (Array.isArray(entry)) {
-        callback(failure(
-          'channel_mismatch',
-          `alert ${alertId} recipients are for channel "sms" (legacy array), not ${EMAIL_CHANNEL}`
-        ));
-        return;
-      }
-      if (typeof entry !== 'object') {
+      // One shape only: a bare array is the pre-release shape and is refused
+      // like any other malformed entry (the feature is unreleased).
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
         callback(failure(
           'channel_mismatch',
           `invalid recipient entry for alert ${alertId}: expected a { channel, targets } object for ${EMAIL_CHANNEL}`

@@ -161,17 +161,17 @@ module.exports = (RED) => {
    * The resolved numbers are only ever passed to the ubus call — never logged,
    * never included in status or error messages.
    *
-   * The artefact is channel-keyed: `{ <alertId>: { channel, targets } }`. The
-   * earlier shape, `{ <alertId>: [mobiles] }`, is still accepted and means
-   * `channel: "sms"`: the readers ship before the artefact changes shape, so a
-   * new node must keep working against an older gateway. Everything that is
-   * not this node's channel — a missing channel, another channel (`email`), an
-   * unknown channel or an entry of the wrong shape — fails closed with
-   * `channel_mismatch`. Never a silent skip and never a fallback to another
-   * transport: hiding the mismatch would turn an activation mistake into a
-   * delivery nobody can explain. `channel_mismatch` means exactly that and
-   * nothing else, so a missing or unusable `targets` list on the sms channel
-   * is `no_recipients`: a targets problem, not a channel problem.
+   * The artefact has exactly one shape: `{ <alertId>: { channel, targets } }`.
+   * A bare array is the pre-release shape of an unreleased feature and is
+   * refused like any other malformed entry — there is no compatibility to
+   * preserve. Everything that is not this node's channel — a missing channel,
+   * another channel (`email`), an unknown channel or an entry of the wrong
+   * shape — fails closed with `channel_mismatch`. Never a silent skip and never
+   * a fallback to another transport: hiding the mismatch would turn an
+   * activation mistake into a delivery nobody can explain. `channel_mismatch`
+   * means exactly that and nothing else, so a missing or unusable `targets`
+   * list on the sms channel is `no_recipients`: a targets problem, not a
+   * channel problem.
    */
   const readRecipients = (file, alertId, callback) => {
     fs.readFile(file, 'utf8', (err, data) => {
@@ -195,19 +195,12 @@ module.exports = (RED) => {
         callback(failure('no_recipients', `no recipients for alert ${alertId}`));
         return;
       }
-      // Legacy artefact: a bare array is the sms channel.
-      if (Array.isArray(entry)) {
-        if (entry.length === 0) {
-          callback(failure('no_recipients', `no recipients for alert ${alertId}`));
-          return;
-        }
-        callback(null, entry);
-        return;
-      }
-      if (typeof entry !== 'object') {
+      // One shape only: a bare array is the pre-release shape and is refused
+      // like any other malformed entry (the feature is unreleased).
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
         callback(failure(
           'channel_mismatch',
-          `invalid recipient entry for alert ${alertId}: expected an array or a { channel, targets } object`
+          `invalid recipient entry for alert ${alertId}: expected a { channel, targets } object`
         ));
         return;
       }

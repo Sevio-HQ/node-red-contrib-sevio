@@ -40,6 +40,25 @@ function tempDir() {
 }
 
 function writeRecipients(dir, contents) {
+  // Fixtures write the SMS target list directly; the artefact itself has one
+  // shape, so an array value is normalised to `{ channel: "sms", targets }`.
+  // A test that must write an invalid shape uses writeRawRecipients.
+  const normalised =
+    typeof contents === 'object' && !Array.isArray(contents)
+      ? Object.fromEntries(
+          Object.entries(contents).map(([id, value]) => [
+            id,
+            Array.isArray(value) ? { channel: 'sms', targets: value } : value,
+          ]),
+        )
+      : contents;
+  const file = path.join(dir, 'recipients.json');
+  fs.writeFileSync(file, typeof normalised === 'string' ? normalised : JSON.stringify(normalised));
+  return file;
+}
+
+/** Writes the contents verbatim, for tests that must produce an invalid shape. */
+function writeRawRecipients(dir, contents) {
   const file = path.join(dir, 'recipients.json');
   fs.writeFileSync(file, typeof contents === 'string' ? contents : JSON.stringify(contents));
   return file;
@@ -658,15 +677,15 @@ test('empty recipient list fails with no_recipients', async (t) => {
 });
 
 // ---------------------------------------------------------------------------
-// Recipients artefact: the compatibility contract (§3.3)
+// Recipients artefact: one shape (§3.3)
 //
-// The artefact is channel-keyed — `{ <alertId>: { channel, targets } }`. The
-// legacy shape `{ <alertId>: [mobiles] }` is accepted as `channel: "sms"` so a
-// new node keeps working against an older gateway; the readers ship before the
-// artefact changes shape. Another, unknown or missing channel fails closed with
-// `channel_mismatch` — never a silent skip and never a fallback to another
-// transport. `channel_mismatch` means only "this entry is not my channel", so a
-// missing or unusable targets list on the sms channel is `no_recipients`.
+// The artefact is channel-keyed — `{ <alertId>: { channel, targets } }` — and
+// that is the only shape. A bare array is the pre-release shape of an
+// unreleased feature and is refused like any other malformed entry. Another,
+// unknown or missing channel fails closed with `channel_mismatch` — never a
+// silent skip and never a fallback to another transport. `channel_mismatch`
+// means only "this entry is not my channel", so a missing or unusable targets
+// list on the sms channel is `no_recipients`.
 // ---------------------------------------------------------------------------
 
 function assertChannelMismatch(node, dir) {
@@ -692,27 +711,17 @@ function assertNoRecipients(node, dir) {
   assert.equal(readCalls(dir).length, 0, 'no recipients must never reach the transport');
 }
 
-test('artefact: a legacy bare array is accepted as the sms channel', async (t) => {
+test('artefact: a bare array is not a shape and fails with channel_mismatch', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const recipients = ['+390000000001', '+390000000002'];
-  const recipientsFile = writeRecipients(dir, { 'a-1': recipients });
-  const ubusBin = writeFakeUbus(dir, [
-    { exit: 0, stdout: { ok: true, ref: 'ref-1' } },
-    { exit: 0, stdout: { ok: true, ref: 'ref-2' } }
-  ]);
+  const recipientsFile = writeRawRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, []);
 
   const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
   const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
 
   assert.equal(err, undefined);
-  assert.deepEqual(readCalls(dir).map((call) => call.data), recipients.map((number) => ({
-    to: [number],
-    body: 'hello'
-  })));
-  const [success, failure] = node.sent[0];
-  assert.equal(failure, null);
-  assert.deepEqual(success.payload, { ok: true, ref: 'ref-1,ref-2' });
+  assertChannelMismatch(node, dir);
 });
 
 test('artefact: an object with channel "sms" fans out its targets', async (t) => {
@@ -1277,8 +1286,8 @@ test('queue: recipients are read inside the slot, not at submission time', async
   const waitPromise = sendInput(waiter, { alertId: 'a-1', body: 'fresh' });
   // The waiter is queued now: rewrite the file before its turn comes.
   fs.writeFileSync(recipientsFile, JSON.stringify({
-    hold: ['+390000000001'],
-    'a-1': ['+390000000009']
+    hold: { channel: 'sms', targets: ['+390000000001'] },
+    'a-1': { channel: 'sms', targets: ['+390000000009'] }
   }));
 
   const [errHold, errWait] = await Promise.all([holdPromise, waitPromise]);
