@@ -40,6 +40,25 @@ function tempDir() {
 }
 
 function writeRecipients(dir, contents) {
+  // Fixtures write the SMS target list directly; the artefact itself has one
+  // shape, so an array value is normalised to `{ channel: "sms", targets }`.
+  // A test that must write an invalid shape uses writeRawRecipients.
+  const normalised =
+    typeof contents === 'object' && !Array.isArray(contents)
+      ? Object.fromEntries(
+          Object.entries(contents).map(([id, value]) => [
+            id,
+            Array.isArray(value) ? { channel: 'sms', targets: value } : value,
+          ]),
+        )
+      : contents;
+  const file = path.join(dir, 'recipients.json');
+  fs.writeFileSync(file, typeof normalised === 'string' ? normalised : JSON.stringify(normalised));
+  return file;
+}
+
+/** Writes the contents verbatim, for tests that must produce an invalid shape. */
+function writeRawRecipients(dir, contents) {
   const file = path.join(dir, 'recipients.json');
   fs.writeFileSync(file, typeof contents === 'string' ? contents : JSON.stringify(contents));
   return file;
@@ -87,14 +106,22 @@ const call = {
 };
 fs.appendFileSync(path.join(dir, 'calls.log'), JSON.stringify(call) + '\\n');
 
+// One line per invocation: <call>:<pid>:<startedAt>. A lingering child is
+// never reaped while the test runs, so the pid is how a test tells whether
+// two ubus processes were ever alive at the same time.
+const count = fs.readFileSync(path.join(dir, 'calls.log'), 'utf8').trim().split('\\n').filter(Boolean).length;
+const recordPid = () => {
+  fs.writeFileSync(path.join(dir, 'pid'), String(process.pid));
+  fs.appendFileSync(path.join(dir, 'pids.log'), count + ':' + process.pid + ':' + Date.now() + '\\n');
+};
+
 process.on('SIGTERM', () => {
   fs.writeFileSync(path.join(dir, 'killed'), '1');
   process.exit(143);
 });
 
 const scenario = JSON.parse(fs.readFileSync(path.join(dir, 'scenario.json'), 'utf8'));
-const calls = fs.readFileSync(path.join(dir, 'calls.log'), 'utf8').trim().split('\\n');
-const step = scenario.steps[Math.min(calls.length - 1, scenario.steps.length - 1)];
+const step = scenario.steps[Math.min(count - 1, scenario.steps.length - 1)];
 
 const emit = () => {
   if (step.stdout !== undefined) process.stdout.write(JSON.stringify(step.stdout));
@@ -103,10 +130,10 @@ const emit = () => {
 };
 
 if (step.hang) {
-  fs.writeFileSync(path.join(dir, 'pid'), String(process.pid));
+  recordPid();
   setInterval(() => {}, 1000);
 } else if (step.delayMs) {
-  fs.writeFileSync(path.join(dir, 'pid'), String(process.pid));
+  recordPid();
   setTimeout(emit, step.delayMs);
 } else {
   emit();
@@ -125,6 +152,38 @@ function readCalls(dir) {
   const file = path.join(dir, 'calls.log');
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+// Every fake-ubus invocation's child: { call, pid, at }, in start order.
+function readPids(dir) {
+  const file = path.join(dir, 'pids.log');
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => {
+    const [call, pid, at] = line.split(':');
+    return { call: Number(call), pid: Number(pid), at: Number(at) };
+  });
+}
+
+/**
+ * True only for a process that is still executing. A child killed with SIGKILL
+ * is dead as soon as the kernel takes it, but until Node reaps it the pid still
+ * answers `kill(pid, 0)` as a zombie — a zombie runs nothing and holds no
+ * modem call, so it is not a second live `ubus`. Off /proc (non-Linux) the
+ * pid's mere existence is the best available answer.
+ */
+function isLive(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    return false;
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const close = stat.lastIndexOf(')');
+    return stat.slice(close + 2, close + 3) !== 'Z';
+  } catch (err) {
+    return true;
+  }
 }
 
 function sendInput(node, payload) {
@@ -617,6 +676,237 @@ test('empty recipient list fails with no_recipients', async (t) => {
   assert.equal(failure.payload.code, 'no_recipients');
 });
 
+// ---------------------------------------------------------------------------
+// Recipients artefact: one shape (§3.3)
+//
+// The artefact is channel-keyed — `{ <alertId>: { channel, targets } }` — and
+// that is the only shape. A bare array is the pre-release shape of an
+// unreleased feature and is refused like any other malformed entry. Another,
+// unknown or missing channel fails closed with `channel_mismatch` — never a
+// silent skip and never a fallback to another transport. `channel_mismatch`
+// means only "this entry is not my channel", so a missing or unusable targets
+// list on the sms channel is `no_recipients`.
+// ---------------------------------------------------------------------------
+
+function assertChannelMismatch(node, dir) {
+  assert.equal(node.sent.length, 1, 'the input produced exactly one output pair');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null, 'a channel mismatch never reports success');
+  assert.equal(failure.payload.ok, false);
+  assert.equal(failure.payload.code, 'channel_mismatch');
+  assert.equal(typeof failure.payload.message, 'string');
+  assert.equal(node.errors.length, 1);
+  assert.equal(node.statusCalls[node.statusCalls.length - 1].fill, 'red');
+  assert.equal(readCalls(dir).length, 0, 'a channel mismatch must never reach the transport');
+}
+
+function assertNoRecipients(node, dir) {
+  assert.equal(node.sent.length, 1, 'the input produced exactly one output pair');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.ok, false);
+  assert.equal(failure.payload.code, 'no_recipients');
+  assert.equal(node.errors.length, 1);
+  assert.equal(node.statusCalls[node.statusCalls.length - 1].fill, 'red');
+  assert.equal(readCalls(dir).length, 0, 'no recipients must never reach the transport');
+}
+
+test('artefact: a bare array is not a shape and fails with channel_mismatch', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRawRecipients(dir, { 'a-1': ['+390000000001'] });
+  const ubusBin = writeFakeUbus(dir, []);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertChannelMismatch(node, dir);
+});
+
+test('artefact: an object with channel "sms" fans out its targets', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipients = ['+390000000001', '+390000000002'];
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'sms', targets: recipients }
+  });
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: true, ref: 'ref-1' } },
+    { exit: 0, stdout: { ok: true, ref: 'ref-2' } }
+  ]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assert.deepEqual(readCalls(dir).map((call) => call.data), recipients.map((number) => ({
+    to: [number],
+    body: 'hello'
+  })));
+  const [success, failure] = node.sent[0];
+  assert.equal(failure, null);
+  assert.deepEqual(success.payload, { ok: true, ref: 'ref-1,ref-2' });
+});
+
+test('artefact: an email entry fails closed with channel_mismatch and is never sent', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['ops@example.com'] }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertChannelMismatch(node, dir);
+  // The address that must not be dialled is not echoed into the failure either.
+  assert.equal(node.sent[0][1].payload.message.includes('ops@example.com'), false);
+});
+
+test('artefact: an unknown channel fails closed with channel_mismatch', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'webhook', targets: ['+390000000001'] }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertChannelMismatch(node, dir);
+});
+
+test('artefact: an entry with no channel fails closed with channel_mismatch', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { targets: ['+390000000001'] }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertChannelMismatch(node, dir);
+});
+
+test('artefact: a non-object entry fails closed with channel_mismatch', async (t) => {
+  const cases = [
+    { name: 'a string entry', entry: '+390000000001' },
+    { name: 'a number entry', entry: 7 }
+  ];
+  for (const testCase of cases) {
+    const dir = tempDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const recipientsFile = writeRecipients(dir, { 'a-1': testCase.entry });
+    const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+    const node = createNodeFactory()({ name: testCase.name, recipientsFile: recipientsFile, ubusBin: ubusBin });
+    const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+    assert.equal(err, undefined);
+    assertChannelMismatch(node, dir);
+  }
+});
+
+test('artefact: a missing targets key on the sms channel fails with no_recipients', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': { channel: 'sms' } });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertNoRecipients(node, dir);
+  // Not a channel problem: the message names the actual problem.
+  assert.equal(node.sent[0][1].payload.message, 'alert a-1 has no usable targets list');
+});
+
+test('artefact: targets that are not an array on the sms channel fail with no_recipients', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'sms', targets: '+390000000001' }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'not-called' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  assertNoRecipients(node, dir);
+  assert.equal(node.sent[0][1].payload.message, 'alert a-1 has no usable targets list');
+});
+
+test('artefact: an empty sms target list still fails with no_recipients', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': { channel: 'sms', targets: [] } });
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile });
+  await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assertNoRecipients(node, dir);
+  assert.equal(node.sent[0][1].payload.message, 'alert a-1 has no usable targets list');
+});
+
+test('artefact: a missing entry keeps no_recipients even when other channels are present', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-2': { channel: 'email', targets: ['ops@example.com'] }
+  });
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile });
+  await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.code, 'no_recipients');
+});
+
+test('artefact: an email entry for another alert does not disturb an sms send', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'email-alert': { channel: 'email', targets: ['ops@example.com'] },
+    'a-1': { channel: 'sms', targets: ['+390000000001'] }
+  });
+  const ubusBin = writeFakeUbus(dir, [{ exit: 0, stdout: { ok: true, ref: 'REF-1' } }]);
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile, ubusBin: ubusBin });
+  const err = await sendInput(node, { alertId: 'a-1', body: 'hello' });
+
+  assert.equal(err, undefined);
+  const calls = readCalls(dir);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].data, { to: ['+390000000001'], body: 'hello' });
+  assert.deepEqual(node.sent[0][0].payload, { ok: true, ref: 'REF-1' });
+});
+
+test('artefact: a channel mismatch calls done() exactly once', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': { channel: 'email', targets: ['ops@example.com'] }
+  });
+
+  const node = createNodeFactory()({ name: 'test', recipientsFile: recipientsFile });
+  const result = await sendInputCounting(node, { alertId: 'a-1', body: 'hello' }).promise;
+  await delay(50);
+
+  assert.equal(result.doneCalls, 1);
+  assert.equal(node.sent[0][1].payload.code, 'channel_mismatch');
+});
+
 test('successful send logs one line with the outcome and ref', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -996,8 +1286,8 @@ test('queue: recipients are read inside the slot, not at submission time', async
   const waitPromise = sendInput(waiter, { alertId: 'a-1', body: 'fresh' });
   // The waiter is queued now: rewrite the file before its turn comes.
   fs.writeFileSync(recipientsFile, JSON.stringify({
-    hold: ['+390000000001'],
-    'a-1': ['+390000000009']
+    hold: { channel: 'sms', targets: ['+390000000001'] },
+    'a-1': { channel: 'sms', targets: ['+390000000009'] }
   }));
 
   const [errHold, errWait] = await Promise.all([holdPromise, waitPromise]);
@@ -1336,7 +1626,7 @@ test('queue: hung ubus child is SIGKILLed after killTimeoutMs', async (t) => {
   assert.equal(fs.existsSync(path.join(dir, 'killed')), false, 'a SIGKILLed child cannot record SIGTERM');
 });
 
-test('queue: wedged slot is force-released and the abandoned run stops sending', async (t) => {
+test('queue: the slot watchdog aborts the wedged run, which stops sending and fails once', async (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const recipientsFile = writeRecipients(dir, {
@@ -1344,7 +1634,7 @@ test('queue: wedged slot is force-released and the abandoned run stops sending',
     next: ['+390000000003']
   });
   // The wedged run's first call outlives its slotMaxMs; the second step serves
-  // the alert that takes the force-released slot.
+  // the alert that takes the slot.
   const ubusBin = writeFakeUbus(dir, [
     { delayMs: 300, stdout: { ok: true, ref: 'wedged-1' } },
     { exit: 0, stdout: { ok: true, ref: 'next' } }
@@ -1365,13 +1655,281 @@ test('queue: wedged slot is force-released and the abandoned run stops sending',
   assert.equal(err, undefined);
   assert.deepEqual(next.sent[0][0].payload, { ok: true, ref: 'next' });
 
-  // Let the wedged run's slow call return: the watchdog has already freed its
-  // slot, so it must not start the second recipient.
+  // The watchdog has already aborted the wedged run before the slot changed
+  // hands: its in-flight call was killed, so the slow reply never arrives and
+  // the second recipient is never attempted.
   await delay(250);
   assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), [
     '+390000000001', '+390000000003'
   ]);
-  assert.equal(wedged.sent.length, 0, 'the abandoned run produces no output');
+  // The abort is the abandoned run's terminal output: exactly one failure,
+  // never silence and never a success for a send the modem did not confirm.
+  assert.equal(wedged.sent.length, 1, 'the abandoned run emits exactly one failure');
+  const [wedgedSuccess, wedgedFailure] = wedged.sent[0];
+  assert.equal(wedgedSuccess, null);
+  assert.equal(wedgedFailure.payload.ok, false);
+  assert.equal(wedgedFailure.payload.code, 'outcome_unknown');
+});
+
+// ---------------------------------------------------------------------------
+// The SLOT watchdog — distinct from the per-child kill backstop just above.
+// The backstop ends one ubus call; the slot watchdog ends the whole run so the
+// slot can change hands. It must abort the run (SIGKILL the child, cancel the
+// retry timers, emit one failure, stop the fan-out) BEFORE the slot transfers:
+// releasing the slot while the abandoned child is still alive puts two ubus
+// calls on the modem at once — and can deliver the same SMS twice, which is
+// exactly what the slot exists to prevent.
+// ---------------------------------------------------------------------------
+
+test('queue: the slot watchdog SIGKILLs the live ubus child before the slot changes hands, and emits one failure', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, {
+    'a-1': ['+390000000001', '+390000000002', '+390000000003'],
+    'b-1': ['+390000000004']
+  });
+  // Every child lingers and never answers: the abandoned run still has a live
+  // ubus process when the slot bound expires.
+  const ubusBin = writeFakeUbus(dir, [{ hang: true }]);
+  const loggerBin = writeFakeLogger(dir);
+  const makeNode = createNodeFactory();
+
+  // Observe the node's own timers: the abandoned child's kill backstop must be
+  // cleared once its callback lands, or the aborted run would keep a timer
+  // alive behind the alert that now holds the slot.
+  const timers = new Map();
+  const realSetTimeout = global.setTimeout;
+  const realClearTimeout = global.clearTimeout;
+  global.setTimeout = function (fn, ms) {
+    const handle = realSetTimeout.apply(this, arguments);
+    timers.set(handle, { ms: ms, cleared: false });
+    return handle;
+  };
+  global.clearTimeout = function (handle) {
+    if (timers.has(handle)) timers.get(handle).cleared = true;
+    return realClearTimeout.apply(this, arguments);
+  };
+  t.after(() => {
+    global.setTimeout = realSetTimeout;
+    global.clearTimeout = realClearTimeout;
+  });
+
+  // Accelerated slot bound and a labelled per-child backstop: whatever kills
+  // the child is the slot watchdog, not the 35 s default backstop.
+  const holder = makeNode({
+    name: 'holder',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    loggerBin: loggerBin,
+    slotMaxMs: 120,
+    killTimeoutMs: 60000
+  });
+  const behind = makeNode({
+    name: 'behind',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    slotMaxMs: 120
+  });
+  // Unconditional cleanup: an assertion failure must still kill the hung
+  // children, or the runner would wait for them forever.
+  const closeAll = () => {
+    behind.emit('close', false, () => {});
+    holder.emit('close', false, () => {});
+  };
+  t.after(closeAll);
+
+  // Observation: how many children are live at each sample. The slot exists so
+  // that this number is never above one.
+  const samples = [];
+  const poller = setInterval(() => {
+    samples.push(readPids(dir).filter((record) => isLive(record.pid)).length);
+  }, 2);
+  t.after(() => clearInterval(poller));
+
+  // Observation: the moment the node kills a child, so the kill can be placed
+  // in time relative to the next child's start.
+  const kills = [];
+  const childProcess = require('node:child_process');
+  const realKill = childProcess.ChildProcess.prototype.kill;
+  childProcess.ChildProcess.prototype.kill = function (signal) {
+    kills.push({ pid: this.pid, signal: signal, at: Date.now() });
+    return realKill.apply(this, arguments);
+  };
+  t.after(() => { childProcess.ChildProcess.prototype.kill = realKill; });
+
+  holder.emit('input', { payload: { alertId: 'a-1', body: 'x' } }, null, () => {});
+  await waitFor(() => readPids(dir).length === 1);
+  const holderChild = readPids(dir)[0];
+
+  // The second node queues behind the holder: its turn IS the slot transfer.
+  behind.emit('input', { payload: { alertId: 'b-1', body: 'x' } }, null, () => {});
+
+  // The abort is what terminates the abandoned input: without it the run would
+  // hang on its child and this never happens.
+  await waitFor(() => holder.sent.length === 1, 3000);
+  // The queued node's turn: its child records the pid a moment after it logs
+  // the call, so wait for the pid record — that is the slot transfer.
+  await waitFor(() => readPids(dir).some((record) => record.call === 2), 3000);
+
+  // 1. Exactly one terminal output, on output 2, and the code is
+  //    outcome_unknown: the slot expired around a send the modem may already
+  //    have accepted, so it is never a retry.
+  assert.equal(holder.sent.length, 1, 'exactly one output for the aborted run');
+  const [success, failed] = holder.sent[0];
+  assert.equal(success, null);
+  assert.equal(failed.payload.ok, false);
+  assert.equal(failed.payload.code, 'outcome_unknown');
+  assert.equal(failed.payload.accepted, 0);
+  assert.equal(failed.payload.total, 3);
+  assert.match(failed.payload.message, /slot expired/);
+  assert.equal(holder.errors.length, 1);
+
+  // 2. The live child is dead, and it was SIGKILLed (the fake records a
+  //    SIGTERM marker, so an absent marker proves the kill was not SIGTERM).
+  const holderKill = kills.find((kill) => kill.pid === holderChild.pid);
+  assert.ok(holderKill, 'the slot watchdog killed the abandoned run\'s child');
+  assert.equal(holderKill.signal, 'SIGKILL');
+  await waitFor(() => !isLive(holderChild.pid), 1000);
+  assert.equal(fs.existsSync(path.join(dir, 'killed')), false, 'the slot kill is SIGKILL, not SIGTERM');
+
+  // 3. The run's own timers are cleared: the abandoned child's 60 s kill
+  //    backstop is gone as soon as its callback lands, so nothing of this run
+  //    is left ticking behind the alert that now holds the slot.
+  const backstops = [...timers.values()].filter((timer) => timer.ms === 60000);
+  assert.equal(backstops.length, 1, 'the abandoned child had exactly one kill backstop');
+  await waitFor(() => backstops[0].cleared === true, 1000);
+  assert.equal(backstops.every((timer) => timer.cleared), true, 'the aborted run left no timer pending');
+
+  // 4. The fan-out stopped: recipients 2 and 3 of the abandoned run are never
+  //    attempted. Call 2 belongs to the alert that now holds the slot.
+  const calls = readCalls(dir);
+  assert.deepEqual(calls.map((call) => call.data.to[0]), ['+390000000001', '+390000000004']);
+
+  // 5. The kill is issued BEFORE the slot changes hands: the next child starts
+  //    only after the abandoned one was killed.
+  const behindChild = readPids(dir).find((record) => record.call === 2);
+  assert.ok(behindChild, 'the queued node takes the slot');
+  assert.ok(
+    holderKill.at <= behindChild.at,
+    `the abandoned child was killed at ${holderKill.at}, the next child started at ${behindChild.at}`
+  );
+
+  // 6. The abort is syslog-visible once, by position: an MSISDN is never
+  //    logged, and the run is never silent about how it ended.
+  await waitFor(() => logLines(dir).length === 1, 2000);
+  assert.match(logLines(dir)[0], /^alert=a-1 to=1\/3 outcome=outcome_unknown$/);
+  assert.equal(logLines(dir)[0].includes('+3900'), false, 'position-only logging');
+
+  // 7. No second failure ever appears, even after the killed child's own close
+  //    callback lands.
+  await delay(120);
+  assert.equal(holder.sent.length, 1, 'the kill callback must not emit a second failure');
+  assert.equal(holder.errors.length, 1);
+
+  // 8. Never more than one live child at any moment.
+  assert.equal(
+    Math.max(0, ...samples),
+    1,
+    `two children were alive at once (${samples.filter((n) => n > 1).length} of ${samples.length} samples)`
+  );
+});
+
+test('queue: the slot watchdog counts an accepted recipient that carried no ref', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001', '+390000000002'] });
+  // Recipient 1 is accepted by rpcd but its reply carries NO `ref` — an answer
+  // shape the modem really returns. Recipient 2 wedges, so the slot expires
+  // around it. Acceptance is a property of the resolved success, not of an
+  // optional reference: the run must report one accepted recipient, not zero.
+  const ubusBin = writeFakeUbus(dir, [
+    { delayMs: 30, stdout: { ok: true } },
+    { hang: true }
+  ]);
+
+  const node = createNodeFactory()({
+    name: 'no-ref',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    slotMaxMs: 400 // long enough for recipient 1, far shorter than recipient 2 hangs
+  });
+  // Unconditional cleanup: an assertion failure must still kill the hung child.
+  t.after(() => node.emit('close', false, () => {}));
+
+  // The abort is what ends this input: a watchdog that only releases the slot
+  // leaves the run abandoned with no terminal output at all.
+  await sendInput(node, { alertId: 'a-1', body: 'no-ref' });
+
+  // Recipient 1 was attempted and accepted before recipient 2 wedged; if the
+  // run had aborted earlier there would be no second call at all.
+  assert.deepEqual(readCalls(dir).map((call) => call.data.to[0]), [
+    '+390000000001', '+390000000002'
+  ]);
+
+  // Exactly one terminal output, on output 2: the ref-less success is never an
+  // error, and the abort never adds a second output.
+  assert.equal(node.sent.length, 1, 'the abandoned run emits exactly one failure');
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.ok, false);
+  assert.equal(failure.payload.code, 'outcome_unknown');
+  assert.equal(failure.payload.accepted, 1, 'the ref-less success is counted as accepted');
+  assert.equal(failure.payload.total, 2);
+});
+
+test('queue: the slot watchdog clears a pending busy-retry timer: the abandoned run never retries', async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const recipientsFile = writeRecipients(dir, { 'a-1': ['+390000000001'] });
+  // A `busy` reply arms the retry timer; the slot bound expires while the run
+  // is still waiting to retry, so the timer is pending at the abort.
+  const ubusBin = writeFakeUbus(dir, [
+    { exit: 0, stdout: { ok: false, code: 'busy', message: 'modem busy' } },
+    { exit: 0, stdout: { ok: true, ref: 'retry' } }
+  ]);
+
+  // Observe every timer the node creates: the retry timer is the one created
+  // with BUSY_RETRY_DELAY_MS (1000 ms), and the abort must have cleared it.
+  const timers = new Map();
+  const realSetTimeout = global.setTimeout;
+  const realClearTimeout = global.clearTimeout;
+  global.setTimeout = function (fn, ms) {
+    const handle = realSetTimeout.apply(this, arguments);
+    timers.set(handle, { ms: ms, cleared: false });
+    return handle;
+  };
+  global.clearTimeout = function (handle) {
+    if (timers.has(handle)) timers.get(handle).cleared = true;
+    return realClearTimeout.apply(this, arguments);
+  };
+  t.after(() => {
+    global.setTimeout = realSetTimeout;
+    global.clearTimeout = realClearTimeout;
+  });
+
+  const node = createNodeFactory()({
+    name: 'busy-holder',
+    recipientsFile: recipientsFile,
+    ubusBin: ubusBin,
+    slotMaxMs: 150 // expires while the retry waits
+  });
+  // The abort is what ends this input: a watchdog that only releases the slot
+  // leaves the run abandoned with no terminal output at all.
+  await sendInput(node, { alertId: 'a-1', body: 'busy' });
+
+  // One busy attempt, one failure — no retry behind the next alert.
+  await delay(1100);
+  assert.equal(readCalls(dir).length, 1, 'the abandoned run never retries');
+  assert.equal(node.sent.length, 1);
+  const [success, failure] = node.sent[0];
+  assert.equal(success, null);
+  assert.equal(failure.payload.code, 'outcome_unknown');
+  assert.equal(failure.payload.accepted, 0);
+  assert.equal(failure.payload.total, 1);
+
+  const retryTimers = [...timers.values()].filter((timer) => timer.ms === 1000);
+  assert.equal(retryTimers.length, 1, 'the busy reply armed exactly one retry timer');
+  assert.equal(retryTimers[0].cleared, true, 'the slot abort cleared the pending retry timer');
 });
 
 test('queue: close during the busy-retry delay drops the slot and cancels the retry', async (t) => {

@@ -148,10 +148,30 @@ module.exports = (RED) => {
     }
   };
 
+  const SMS_CHANNEL = 'sms';
+
+  // Names the channel of a rejected entry for the error message without ever
+  // rendering a non-string as `[object Object]` or `undefined`.
+  const channelName = (channel) => (
+    typeof channel === 'string' && channel !== '' ? JSON.stringify(channel) : 'missing'
+  );
+
   /**
    * Resolves recipient numbers for an alert from the datagateway-written file.
    * The resolved numbers are only ever passed to the ubus call — never logged,
    * never included in status or error messages.
+   *
+   * The artefact has exactly one shape: `{ <alertId>: { channel, targets } }`.
+   * A bare array is the pre-release shape of an unreleased feature and is
+   * refused like any other malformed entry — there is no compatibility to
+   * preserve. Everything that is not this node's channel — a missing channel,
+   * another channel (`email`), an unknown channel or an entry of the wrong
+   * shape — fails closed with `channel_mismatch`. Never a silent skip and never
+   * a fallback to another transport: hiding the mismatch would turn an
+   * activation mistake into a delivery nobody can explain. `channel_mismatch`
+   * means exactly that and nothing else, so a missing or unusable `targets`
+   * list on the sms channel is `no_recipients`: a targets problem, not a
+   * channel problem.
    */
   const readRecipients = (file, alertId, callback) => {
     fs.readFile(file, 'utf8', (err, data) => {
@@ -170,12 +190,34 @@ module.exports = (RED) => {
         callback(failure('recipients_unavailable', `invalid recipients file content: ${file}`));
         return;
       }
-      const to = map[alertId];
-      if (!Array.isArray(to) || to.length === 0) {
+      const entry = map[alertId];
+      if (entry === undefined || entry === null) {
         callback(failure('no_recipients', `no recipients for alert ${alertId}`));
         return;
       }
-      callback(null, to);
+      // One shape only: a bare array is the pre-release shape and is refused
+      // like any other malformed entry (the feature is unreleased).
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        callback(failure(
+          'channel_mismatch',
+          `invalid recipient entry for alert ${alertId}: expected a { channel, targets } object`
+        ));
+        return;
+      }
+      if (entry.channel !== SMS_CHANNEL) {
+        callback(failure(
+          'channel_mismatch',
+          `alert ${alertId} recipients are for channel ${channelName(entry.channel)}, not ${SMS_CHANNEL}`
+        ));
+        return;
+      }
+      // `channel_mismatch` means exactly one thing — this entry is not my
+      // channel — so a list problem on the sms channel is `no_recipients`.
+      if (!Array.isArray(entry.targets) || entry.targets.length === 0) {
+        callback(failure('no_recipients', `alert ${alertId} has no usable targets list`));
+        return;
+      }
+      callback(null, entry.targets);
     });
   };
 
@@ -253,6 +295,13 @@ module.exports = (RED) => {
   // fan-out touches the modem at a time. A slot holds a whole fan-out, not a
   // single ubus call — the fan-out is one logical alert and its per-recipient
   // calls must not interleave with another alert's.
+  //
+  // The slot bound is a hard stop, not merely an accounting deadline: when it
+  // expires the owning run is still alive, so the watchdog ABORTS it (kills the
+  // live child, cancels its retry timers, emits one failure) and only then
+  // releases the slot. Releasing first would put two `ubus` calls on the modem
+  // at once — and could send the same SMS twice — which is exactly what the
+  // slot exists to prevent.
   // ---------------------------------------------------------------------------
   const waiters = [];
   let held = false;
@@ -263,7 +312,17 @@ module.exports = (RED) => {
     clearTimeout(waiter.timer); // the wait is over: queueWaitMs bounds waiting only, never the send
     held = true;
     let released = false;
-    const watchdog = setTimeout(release, waiter.slotMaxMs);
+    const watchdog = setTimeout(() => {
+      // A terminal path already released the slot and cleared this timer.
+      if (released) return;
+      try {
+        // Abort BEFORE the transfer, and even if the abort throws: the slot
+        // must never stay held because cleanup failed.
+        if (waiter.onSlotExpired) waiter.onSlotExpired();
+      } finally {
+        release();
+      }
+    }, waiter.slotMaxMs);
     // Idempotent: success, every failure, every closed early-return and the
     // watchdog can all call it; only the first call frees the slot.
     function release() {
@@ -286,9 +345,19 @@ module.exports = (RED) => {
    * for the acquired slot (each node passes its own; the shared pump has no
    * node config). `onTimeout` fires if the turn does not come within `waitMs`,
    * with the waiter already removed from the queue and no slot ever held.
+   *
+   * `onSlotExpired` is the run's abort hook. It runs synchronously when the
+   * slot watchdog fires, while the run still holds the slot: it must kill what
+   * the run has live, emit its one terminal output and return. The slot is
+   * released after it returns, never before.
    */
-  const acquire = (owner, waitMs, start, onTimeout, slotMaxMs) => {
-    const waiter = { owner: owner, start: start, slotMaxMs: slotMaxMs || SLOT_MAX_MS };
+  const acquire = (owner, waitMs, start, onTimeout, slotMaxMs, onSlotExpired) => {
+    const waiter = {
+      owner: owner,
+      start: start,
+      slotMaxMs: slotMaxMs || SLOT_MAX_MS,
+      onSlotExpired: onSlotExpired
+    };
     waiter.timer = setTimeout(() => {
       const i = waiters.indexOf(waiter);
       // Already started or swept by close (both clear the timer first): the
@@ -362,21 +431,48 @@ module.exports = (RED) => {
       // failure and the closed early-returns — so a failed or aborted send can
       // never wedge the process-wide queue. `slotReleased()` is true once the
       // slot watchdog has freed the slot under this input.
+
+      // --- this run's own state -------------------------------------------
+      // A run owns its live children and its retry timers, so the slot
+      // watchdog can abort exactly this run: `children`/`retryTimers` above are
+      // the node-wide registries `close` sweeps, and every entry lives in both.
+      // `runDone` makes the terminal output structurally single: whichever path
+      // arrives second (the abort's kill callback, a late child close) is a
+      // no-op instead of a second failure on output 2.
+      const runChildren = new Set();
+      const runTimers = new Set();
+      let runDone = false;     // a terminal output already happened
+      let runAborted = false;  // the slot watchdog took this run away
+      let runIndex = 0;        // recipient in flight, for the failure message
+      let runTotal = 0;        // recipients this run knows about
+      let runAccepted = 0;     // recipients rpcd confirmed, ref or no ref
+
       let release = null;
       let slotReleased = null;
 
-      const fail = (code, message) => {
-        if (release) release();
-        if (closed) return;
+      // The single terminal failure path. Never releases the slot: `fail` does
+      // that first, and the slot watchdog releases only after `abortRun` — the
+      // abort must kill the child while the run still owns the slot.
+      const emitFailure = (code, message, extra) => {
+        if (closed || runDone) return;
+        runDone = true;
         node.status({ fill: 'red', shape: 'dot', text: code });
         node.error(message, msg);
-        send([null, Object.assign({}, msg, { payload: { ok: false, code: code, message: message } })]);
+        send([null, Object.assign({}, msg, {
+          payload: Object.assign({ ok: false, code: code, message: message }, extra)
+        })]);
         done();
+      };
+
+      const fail = (code, message, extra) => {
+        if (release) release();
+        emitFailure(code, message, extra);
       };
 
       const succeed = (refs) => {
         if (release) release();
-        if (closed) return;
+        if (closed || runDone) return;
+        runDone = true;
         const out = Object.assign({}, msg, { payload: { ok: true } });
         if (refs.length > 0) {
           out.payload.ref = refs.join(',');
@@ -390,6 +486,52 @@ module.exports = (RED) => {
       // done(): Node-RED has already closed the node and drops both.
       const drop = () => {
         if (release) release();
+      };
+
+      const slotTimeoutMessage = () => {
+        const inFlight = runTotal > 0 ? ` with recipient ${runIndex + 1}/${runTotal} in flight` : '';
+        return `the sms send slot expired after ${slotMaxMs}ms${inFlight}: ` +
+          'the modem did not confirm the send, and a retry could send the message twice';
+      };
+
+      /**
+       * The slot watchdog's abort hook: called while this run still owns the
+       * slot, before the slot changes hands. Everything the abandoned run
+       * could still do is stopped here, in order:
+       *
+       * 1. every live child is SIGKILLed — a `ubus` call that outlived the
+       *    slot must not survive and overlap the run that now holds the slot;
+       * 2. the pending busy-retry timers are cancelled, so no retry re-enters
+       *    the transport behind the next alert's back;
+       * 3. the fan-out stops (`runAborted` makes `sendNext` and every late
+       *    child callback a no-op), so no later recipient is attempted;
+       * 4. exactly one terminal output is emitted, on output 2.
+       *
+       * The code is `outcome_unknown`, never a retry: the slot expired around a
+       * message the modem may already have accepted, and a retry could send it
+       * twice. It does not release the slot; `pump` does that once this returns.
+       */
+      const abortRun = () => {
+        if (closed || runDone) return;
+        runAborted = true;
+        for (const entry of runTimers) {
+          clearTimeout(entry.timer);
+          retryTimers.delete(entry);
+        }
+        runTimers.clear();
+        const wasInFlight = runChildren.size > 0;
+        for (const child of runChildren) {
+          children.delete(child);
+          child.kill('SIGKILL');
+        }
+        runChildren.clear();
+        if (wasInFlight) {
+          logSend(loggerBin, loggerTag, alertId, runIndex, runTotal, 'outcome_unknown');
+        }
+        emitFailure('outcome_unknown', slotTimeoutMessage(), {
+          accepted: runAccepted,
+          total: runTotal
+        });
       };
 
       const payload = msg.payload;
@@ -418,6 +560,9 @@ module.exports = (RED) => {
             drop();
             return;
           }
+          // The run is over (aborted by the slot watchdog, or already
+          // terminal): the file read that lands late must not start a send.
+          if (runAborted || runDone) return;
           if (slotReleased && slotReleased()) {
             return;
           }
@@ -425,6 +570,7 @@ module.exports = (RED) => {
             fail(err.code, err.message);
             return;
           }
+          runTotal = to.length;
 
           // The UI validates the body charset on save, so a body that still
           // carries an uncarriable character is an already-stored legacy
@@ -444,6 +590,9 @@ module.exports = (RED) => {
           // that fails; only report success once all of them have succeeded.
           const refs = [];
           const sendNext = (index, busyRetries) => {
+            // The run is over: the slot watchdog aborted it, or it already
+            // produced its terminal output. No later recipient is attempted.
+            if (runAborted || runDone) return;
             if (closed) {
               drop();
               return;
@@ -458,13 +607,24 @@ module.exports = (RED) => {
               succeed(refs);
               return;
             }
+            runIndex = index;
 
-            const child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, killTimeoutMs, { to: [to[index]], body: sendable.body }, (ubusErr, result) => {
-              children.delete(child);
+            // `child` may still be null when the callback runs synchronously:
+            // then there is nothing to register or remove.
+            let child = null;
+            child = callUbus(ubusBin, ubusSocket, UBUS_TIMEOUT_SEC, killTimeoutMs, { to: [to[index]], body: sendable.body }, (ubusErr, result) => {
+              if (child) {
+                children.delete(child);
+                runChildren.delete(child);
+              }
               if (closed) {
                 drop();
                 return;
               }
+              // The slot watchdog aborted this run: the callback of its own
+              // killed child must not add a second output nor resume the
+              // fan-out.
+              if (runAborted || runDone) return;
               if (slotReleased && slotReleased()) {
                 return;
               }
@@ -476,6 +636,11 @@ module.exports = (RED) => {
 
               const reply = result && typeof result === 'object' ? result : {};
               if (reply.ok) {
+                // Acceptance is counted per resolved success, never derived
+                // from `refs`: rpcd answers `{ ok: true }` without a reference
+                // on some paths, and such a send is still accepted by the
+                // modem. `refs` only feeds the success payload's `ref`.
+                runAccepted += 1;
                 let ref = null;
                 if (reply.ref !== undefined && reply.ref !== null) {
                   ref = reply.ref;
@@ -497,21 +662,26 @@ module.exports = (RED) => {
                 const entry = { timer: null, drop: drop };
                 entry.timer = setTimeout(() => {
                   retryTimers.delete(entry);
+                  runTimers.delete(entry);
                   sendNext(index, busyRetries + 1);
                 }, BUSY_RETRY_DELAY_MS);
                 retryTimers.add(entry);
+                runTimers.add(entry);
                 return;
               }
               fail(code, message);
             });
-            children.add(child);
+            if (child) {
+              children.add(child);
+              runChildren.add(child);
+            }
           };
 
           sendNext(0, 0);
         });
       }, () => {
         fail('queue_timeout', `sms queue wait exceeded ${queueWaitMs}ms`);
-      }, slotMaxMs);
+      }, slotMaxMs, abortRun);
     });
 
     node.on('close', function (removed, done) {
