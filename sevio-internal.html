@@ -1,0 +1,70 @@
+<script type="text/javascript">
+  RED.nodes.registerType('sevio-internal', {
+    category: 'Sevio',
+    color: '#a6bbcf',
+    defaults: {
+      name: { value: '' },
+      url: { value: 'http://127.0.0.1:3001/internal/telemetry', required: true },
+      groups: { value: 'gps,device,environment' },
+      vrfName: { value: 'vrf-lan' },
+      timeoutMs: { value: 5000, validate: RED.validators.number() }
+    },
+    inputs: 1,
+    outputs: 1,
+    icon: 'bridge.svg',
+    label: function() {
+      return this.name || 'sevio-internal';
+    }
+  });
+</script>
+
+<script type="text/html" data-template-name="sevio-internal">
+  <div class="form-row">
+    <label for="node-input-name">
+      <i class="fa fa-tag"></i>
+      Name
+    </label>
+    <input type="text" id="node-input-name" placeholder="Name">
+  </div>
+  <div class="form-row">
+    <label for="node-input-url">
+      <i class="fa fa-link"></i>
+      URL
+    </label>
+    <input type="text" id="node-input-url" placeholder="http://127.0.0.1:3001/internal/telemetry">
+  </div>
+  <div class="form-row">
+    <label for="node-input-groups">
+      <i class="fa fa-list"></i>
+      Groups
+    </label>
+    <input type="text" id="node-input-groups" placeholder="gps,device,environment">
+  </div>
+  <div class="form-row">
+    <label for="node-input-vrfName">
+      <i class="fa fa-network-wired"></i>
+      VRF
+    </label>
+    <input type="text" id="node-input-vrfName" placeholder="vrf-lan">
+  </div>
+  <div class="form-row">
+    <label for="node-input-timeoutMs">
+      <i class="fa fa-clock-o"></i>
+      Timeout
+    </label>
+    <input type="text" id="node-input-timeoutMs" placeholder="5000">
+  </div>
+</script>
+
+<script type="text/html" data-help-name="sevio-internal">
+  <p>Reads the router's internal data (GPS, device state, environment) from the
+  data gateway API and emits it as the flow's dataframe.</p>
+  <p>On the router the API runs inside the <code>vrf-lan</code> VRF while Node-RED
+  does not, so the request is made over a socket bound to that VRF with
+  <code>sockopt</code> (<code>SO_BINDTODEVICE</code>) — the same mechanism the
+  Modbus client uses. Where <code>sockopt</code> is not installed (a dev machine,
+  the docker harness) or the VRF field is empty, a plain socket is used.</p>
+  <p>Output <code>msg.payload</code>: <code>[{ name, value, timestamp }]</code>,
+  one entry per enabled property. A non-2xx answer, invalid JSON or a timeout
+  raises an error and sends nothing.</p>
+</script>
