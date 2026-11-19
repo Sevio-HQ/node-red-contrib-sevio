@@ -36,7 +36,13 @@ function startServer(handler) {
     server.listen(0, '127.0.0.1', () => {
       resolve({
         url: `http://127.0.0.1:${server.address().port}/t`,
-        close: () => new Promise((done) => server.close(done)),
+        // Tear down any connection still open — a spec that deliberately leaves
+        // a request unsettled must not hang the suite in `close()`.
+        close: () =>
+          new Promise((done) => {
+            server.closeAllConnections();
+            server.close(done);
+          }),
       });
     });
   });
@@ -51,6 +57,18 @@ function drive(node, msg = {}) {
       (err) => resolve({ sent: null, err }),
     );
   });
+}
+
+/**
+ * `drive`, but a node that never settles fails the spec instead of hanging the
+ * suite — the deadline and truncation specs would otherwise block forever if
+ * their handler were removed.
+ */
+function driveWithin(node, timeoutMs = 1500) {
+  return Promise.race([
+    drive(node),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('the node never settled')), timeoutMs)),
+  ]);
 }
 
 const okBody = (readings) => (req, res) => {
@@ -122,13 +140,17 @@ test('invalid JSON is an error', async () => {
 });
 
 test('the timeout is a deadline, not an inactivity window', async () => {
-  const server = await startServer(() => {
-    // accept and never answer
+  // The server keeps writing below the inactivity window, so an inactivity
+  // timer would never fire; only an overall deadline can settle this request.
+  const server = await startServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const trickle = setInterval(() => res.write(' '), 40);
+    res.on('close', () => clearInterval(trickle));
   });
   try {
     const node = makeNode({ url: server.url, groups: '', vrfName: '', timeoutMs: 200 });
     const started = Date.now();
-    const result = await drive(node);
+    const result = await driveWithin(node, 1000);
     assert.equal(result.sent, null);
     assert.match(result.err.message, /timed out after 200 ms/);
     assert.ok(Date.now() - started < 1000, 'the deadline bounds the request');
@@ -138,16 +160,19 @@ test('the timeout is a deadline, not an inactivity window', async () => {
 });
 
 test('a truncated response is an error', async () => {
+  // Headers and a partial body must reach the client before the socket dies: an
+  // immediate destroy only produces a request-level reset, which never exercises
+  // the response-error path this spec is about.
   const server = await startServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '100' });
-    res.write('[{"name":');
-    res.destroy();
+    res.write('[{"name":', () => setTimeout(() => res.destroy(), 50));
   });
   try {
-    const node = makeNode({ url: server.url, groups: '', vrfName: '', timeoutMs: 1000 });
-    const result = await drive(node);
+    const node = makeNode({ url: server.url, groups: '', vrfName: '', timeoutMs: 5000 });
+    const result = await driveWithin(node, 1500);
     assert.equal(result.sent, null);
     assert.ok(result.err, 'the request must settle');
+    assert.doesNotMatch(result.err.message, /timed out/, 'the truncation, not the deadline, must settle it');
   } finally {
     await server.close();
   }
